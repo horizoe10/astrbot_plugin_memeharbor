@@ -1,4 +1,4 @@
-"""Bounded image loading for official QQ, OneBot and standard image segments."""
+"""Bounded loading of AstrBot image components with adapter-specific fallbacks."""
 
 from __future__ import annotations
 

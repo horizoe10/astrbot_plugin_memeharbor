@@ -62,14 +62,14 @@ HELP = """MemeHarbor 1.0
 标签重命名 旧 新 / 标签合并 旧 新（管理员）
 删除图片 12 / 回收站 / 恢复图片 12
 识图 12 / AI搜图 一只生气的猫（AI需启用）
-QQ 官方请 @机器人；也可先“收集 标签”，60秒内再 @机器人发送图片。
+按当前群聊平台的方式唤醒机器人；也可先“收集 标签”，60秒内再发送图片。
 网页图库：插件详情 → Pages → MemeHarbor。"""
 
 
 @register(
     PLUGIN,
     "Ghostberry",
-    "QQ 官方优先的MemeHarbor：搜图、分页预览、标签管理与防重复发送",
+    "MemeHarbor 跨平台群聊表情库：搜图、分页预览、标签管理与防重复发送",
     VERSION,
 )
 class MemeHarborPlugin(Star, GalleryAPI):
@@ -447,7 +447,7 @@ class MemeHarborPlugin(Star, GalleryAPI):
             for item in selected:
                 current = await asyncio.to_thread(self.library.get, item["id"])
                 path = self.library.path(current)
-                # Official QQ accepts a normal image; no OneBot forward nodes.
+                # Use AstrBot's standard image component across adapters.
                 await event.send(event.chain_result([Image.fromFileSystem(str(path))]))
                 history.append(item["digest"])
                 self.remember(self.recent, scope, history)
