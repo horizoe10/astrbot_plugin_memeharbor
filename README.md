@@ -1,149 +1,87 @@
-<p align="center"><img src="logo.png" width="150" alt="MemeHarbor logo"></p>
-<h1 align="center">MemeHarbor</h1>
-<p align="center"><strong>Collect once. Find fast. Reply fresh.</strong></p>
-<p align="center">A QQ Official-first meme library for AstrBot · v1.0</p>
-<p align="center"><a href="README.zh-CN.md">中文说明</a> · <a href="docs/MIGRATION.md">Migration guide</a> · <a href="https://github.com/horizoe10/astrbot_plugin_memeharbor/issues">Report an issue</a></p>
+<p align="center"><img src="logo.png" width="150" alt="MemeHarbor"></p>
+<h1 align="center">MemeHarbor · 表情港湾</h1>
+<p align="center"><strong>收一次，找得快，每次都有新回应。</strong></p>
+<p align="center">面向 QQ 官方机器人的 AstrBot 群聊表情库 · v1.0</p>
+<p align="center"><a href="README.en.md">English</a> · <a href="docs/MIGRATION.md">旧版迁移</a> · <a href="https://github.com/horizoe10/astrbot_plugin_memeharbor/issues">反馈问题</a></p>
 
-MemeHarbor turns a pile of reaction images into a searchable collection you can use during a conversation. Collect an image once, give it several tags, browse a numbered contact sheet, and send the original when the moment fits. Random replies prefer images your group has not seen recently.
+聊天里的好表情，不该淹没在文件夹里。MemeHarbor 把收集、检索和发送连成一个流程：给图片打多个标签，翻看带编号的预览，再把合适的原图发回群里。随机斗图会优先避开本群近期发过的图片。
 
-## What you get
+## 从图片回复脚本，到可管理的表情库
 
-| Capability | How it helps in chat |
-|---|---|
-| **Capture without ceremony** | Collect an attached image, a quoted image, or a 60-second follow-up message. Identical files merge their tags. |
-| **Search by intent** | Combine tags, exclude a mood, or match alternatives: `猫 憋笑`, `猫 -伤心`, `猫 \| 狗`. |
-| **Browse before sending** | Numbered preview sheets, independent per-user paging, and stable IDs. GIF previews are static; originals stay animated. |
-| **Keep replies fresh** | Per-group recent-history tracking, content-based batch deduplication, cooldowns, and a three-image sending cap. |
-| **Organize with confidence** | Edit or merge tags, manage ownership, and use a recoverable recycle bin. Removing a tag never deletes a file. |
-| **Manage outside chat** | An embedded gallery for search, batch edits, uploads, original downloads, and ZIP backup/import. |
-| **Add AI when useful** | Optional descriptions, OCR, suggested tags, and natural-language retrieval through your AstrBot model. Off by default. |
+- **随手收集**：图片与命令同发、引用图片、先发命令再补图；相同文件合并标签。
+- **组合搜图**：多词同时满足、排除标签、任选条件；固定编号定位图片。
+- **预览再发送**：一张拼图看一页，每个人独立翻页；发送原文件时保留 GIF。
+- **不总发同一张**：按群记录近期内容，同批去重、冷却和数量上限。
+- **整理可撤销**：标签增删、全库合并、收集者权限和回收站；移除标签不删除原图。
+- **网页管理**：批量标签、上传、下载和整库 ZIP 导入导出。
+- **AI 按需启用**：描述、OCR、标签建议和自然语言搜索，默认关闭。
 
-## Install
+## 安装
 
-Requires **AstrBot 4.29.0-beta.1 or later in the 4.x series** and **Python 3.12+**. Runtime dependencies are `aiohttp` and `Pillow`.
-
-In AstrBot's plugin manager, install from this repository URL:
+需要 AstrBot **4.29.0-beta.1 或更新的 4.x**、Python **3.12+**。插件管理 → 从链接安装：
 
 ```text
 https://github.com/horizoe10/astrbot_plugin_memeharbor
 ```
 
-Alternatively, download **Code → Download ZIP** and use the local ZIP installer. Enable **MemeHarbor** in the configuration profile used by your bot or group. Installation does not automatically add it to every restricted plugin allowlist.
+也可通过仓库 **Code → Download ZIP** 下载，再本地安装。安装后在机器人对应的配置文件中启用 **MemeHarbor**。
 
-**Coming from Image Replay?** Disable the old plugin and back up its data first. MemeHarbor has a new plugin ID and copies an existing library into its own data directory on the first empty installation. Read the [migration guide](docs/MIGRATION.md).
+旧版用户请先备份并停用 Image Replay。新标识为 `astrbot_plugin_memeharbor`，首次空目录安装会复制旧图库，原始数据保留。[迁移步骤](docs/MIGRATION.md)。
 
-## Your first collection
+## 三步开始
 
-Mention the bot in a QQ Official group and attach an image with:
+在 QQ 官方群里 @机器人，附图并发送：
 
 ```text
 /收集 猫 憋笑
-```
-
-Then try:
-
-```text
 /搜图 猫 憋笑
-/下一页
 /发图 12
-/随机图 猫 3
 ```
 
-Replace `12` with an actual ID from your preview. `/memeharbor` or `斗图帮助` shows help. Chinese chat commands are retained for existing users; an optional `/memeharbor` prefix also works, for example `/memeharbor 搜图 猫`.
+`12` 请替换为预览里的真实编号。`/memeharbor` 或 `斗图帮助` 查看帮助，也支持 `/memeharbor 搜图 猫`。
 
-### Trigger rules
-
-- Explicit `/收集` works even when AstrBot's global wake-prefix list is empty. Full-width `／` is accepted.
-- With `require_wake=false`, bare `收集 猫` and exact-tag quick replies work when AstrBot receives the message.
-- With `require_wake=true`, bare commands and quick replies require a mention or framework wake condition.
-- A message matching both command paths executes only once. Runtime command enablement, aliases, permissions, and plugin allowlists still apply.
-
-## Command reference
-
-| Command | Result |
+| 想做什么 | 发送什么 |
 |---|---|
-| `收集 标签1 标签2` | Collect attached/quoted images, or wait 60 seconds for the same user's next image in that chat. |
-| `取消收集` | Cancel waiting for an image. |
-| `搜图 猫 憋笑` | Match both terms. Also accepts `找图`. |
-| `搜图 猫 -伤心` | Include a term and exclude another. |
-| `搜图 猫 \| 狗` | Match either group of conditions. |
-| `搜图 #12` | Find a particular image ID. |
-| `查看图片` | Browse the active library. |
-| `下一页` / `上一页` / `图片翻页 2` | Navigate your own search for up to 10 minutes. |
-| `发图 12` / `随机图 猫 3` | Send an original or up to three distinct matching images. |
-| `图片详情 12` | Show tags, date, description, OCR and send count. |
-| `标签列表 2` / `图库统计` | Browse tags or collection statistics. |
-| `标签添加 12 可爱` / `标签移除 12 憋笑` | Edit one image's tags. |
-| `标签重命名 旧 新` / `标签合并 旧 新` | Rename/merge a tag across the active library; administrator only. |
-| `删除图片 12` / `恢复图片 12` | Recycle or restore an image. |
-| `回收站` | Browse recycled images you can manage. |
-| `识图 12` | Save an AI description and OCR; suggest tags without applying them. |
-| `AI搜图 一只假装生气的猫` | Rank candidates using existing tags, descriptions and OCR. |
+| 多标签同时满足 | `搜图 猫 憋笑` |
+| 排除标签 | `搜图 猫 -伤心` |
+| 条件任选 | `搜图 猫 \| 狗` |
+| 浏览与翻页 | `查看图片`、`下一页`、`上一页`、`图片翻页 2` |
+| 随机斗图 | 直接发已有标签，或 `随机图 猫 3` |
+| 编辑标签 | `标签添加 12 可爱`、`标签移除 12 憋笑` |
+| 全库统一标签 | `标签重命名 旧 新`、`标签合并 旧 新`（管理员） |
+| 删除与撤销 | `删除图片 12`、`回收站`、`恢复图片 12` |
+| 查看详情 | `图片详情 12`、`标签列表`、`图库统计` |
+| 两步收图 | `收集 猫`，60秒内同一人同一会话补图；`取消收集` 可取消 |
+| AI 辅助 | `识图 12`、`AI搜图 一只假装生气的猫`（需启用） |
 
-Search ignores case by default. Quick replies match exact tags, not casual OCR text. Tags are limited to 32 characters and 24 tags per image. The old `删除图片指令 标签 ALL` operation is retired: select IDs or remove tags explicitly instead.
+`/收集` 兼容全局唤醒前缀为空的情况；`require_wake=false` 时也能裸发 `收集`。开启该配置时，裸命令和快捷标签仍需 @ 或唤醒。QQ 官方是否把消息交给机器人仍受平台规则约束。
 
-## Built for QQ Official
+## QQ 官方的处理方式
 
-MemeHarbor sends ordinary image components rather than OneBot merged-forward nodes. Each preview is one numbered contact sheet. Collection reads standard AstrBot Image/Reply components and QQ Official attachments.
+普通图片直接发送；分页预览合成单张拼图，不依赖 OneBot 合并转发。引用消息没有原图地址时，请把图片与命令同发或使用两步收图。插件不会对 QQ 官方调用 OneBot 的取消息接口。
 
-QQ Official may omit the original attachment URL from a quote. If it does, send the image alongside the command or use two-message collection. The plugin does not call OneBot message-fetch APIs on QQ Official. Standard OneBot image/quote collection is retained; group-file attachments are not automatically treated as images.
+单次默认最多3张原图，同一用户默认2秒冷却。近期去重按机器人和群隔离，不因同群用户会话隔离而失效。只有一张图时无法避免重复；指定编号发图不参与随机选择，但仍受冷却限制。平台审核、被动回复次数和频率限制仍然适用。
 
-Tencent's delivery, passive-reply quotas, rate limits and content review still apply. A successful adapter return is recorded as a send; failures swallowed by an adapter cannot be independently confirmed by the plugin.
+## 网页图库与备份
 
-## Web gallery
+入口：**插件详情 → Pages → MemeHarbor**。登录面板后即可浏览、批量整理、下载原图和恢复回收站。新上传的图使用“待整理”标签。
 
-Open **Plugin details → Pages → MemeHarbor** in the authenticated AstrBot Dashboard.
+ZIP 导入按内容合并，编号可能变化，不是原地回滚；已有图片的描述和回收站状态不会被覆盖。ZIP 上传最多30MB，展开最多150MB、1000张；大图库请直接备份整个数据目录。回收站不会自动清空。
 
-- Browse 12 thumbnails per page, search and download originals.
-- Batch-add/remove tags, recycle and restore images.
-- Edit one image or request optional AI tag suggestions.
-- Upload image files or merge a backup made by this plugin.
-- Export images, tags, descriptions, OCR and recycle state together.
+## AI 默认关闭
 
-New uploads receive the tag `待整理`. Import merges by file content: IDs can change, while existing descriptions and recycle state remain intact. It is **not an in-place rollback**. Uploaded ZIPs are limited to 30 MB, 150 MB expanded, and 1,000 records. Back up the entire data directory for larger collections. Recycled images are not automatically purged.
+开启 `ai_enabled`，选择已有的 AstrBot 模型提供商 ID（不是 API Key）。识图需视觉模型。聊天可沿用会话模型，网页识图需明确填写提供商 ID。
 
-## Settings that matter
+只有显式请求才调用 AI；识图会把所选图片发给模型，可能产生费用。建议标签需要手动采纳。AI 搜图使用最近200张图已有的标签、描述和 OCR，最多返回24张候选；它不是全库向量搜索，不会自动分析全部原图。
 
-| Setting | Default | Purpose |
-|---|---|---|
-| `require_wake` | `true` | Require a mention/wake for bare commands and quick replies. |
-| `page_size` | `9` | Chat preview size, 3–12. |
-| `max_send_count` | `3` | Per-request image cap, 1–3. |
-| `recent_window` | `10` | Recent sends to avoid per group/chat. |
-| `send_cooldown` | `2` | Seconds between one user's image sends in a chat. |
-| `max_image_mb` | `15` | Per-image upload/download limit. |
-| `download_use_proxy` | `true` | Follow AstrBot's proxy environment. |
-| `allow_owner_manage` | `true` | Let collectors manage their own images. |
-| `collect_admin_only` | `false` | Optionally restrict collection to administrators. |
-| `ai_enabled` | `false` | Enable explicit AI requests. |
-| `ai_provider_id` | empty | Existing AstrBot provider ID, not an API key. |
-| `ai_admin_only` | `true` | Restrict chat AI commands to administrators. |
+## 数据与权限
 
-Group/user allowlists and blocklists remain available; QQ Official uses openids. The library is shared across groups. Recent-send state is separated by bot/group; paging and cooldowns also distinguish users. Restarting clears temporary paging, pending capture and recent-send state, but keeps images, tags and send counts.
+数据保存在 `data/plugin_data/astrbot_plugin_memeharbor/`。`library_v2.sqlite3` 的 v2 是索引格式，与 MemeHarbor v1.0 产品版本无关。
 
-When every candidate has appeared recently, random replies rotate through the least recently sent images. A one-image collection necessarily repeats. Explicit ID requests bypass random selection, but still obey cooldowns.
+各群共享图库。默认管理员和原收集者能管理对应图片；旧图没有收集者记录的由管理员管理。群/用户黑白名单保留，QQ 官方填写 openid。重启清空翻页、待收图和近期去重记录，图片、标签与累计发送数保留。
 
-## Optional AI, explicit control
+## 致谢
 
-Choose a model already configured in AstrBot. Description/OCR requires a vision-capable model. Chat commands can use the current conversation's provider; web requests require an explicit provider ID.
+由 **[Ghostberry / horizoe10](https://github.com/horizoe10)** 独立维护。项目从用户提供的 **[cuman / cumany 的 Image Replay](https://github.com/cumany/astrbot_plugin_image_replay)** 演进，上游 README 另注明受 [Custom Menu](https://github.com/Futureppo/astrbot_plugin_custom_menu) 启发。本项目保留来源记录，并非上游官方版本。
 
-AI is called only when requested. Image analysis sends the selected image to that provider and can incur its normal usage fees. Suggested tags need manual acceptance. AI search considers at most the newest 200 images' existing metadata and returns up to 24 results. It does not analyze all originals or maintain a vector database. Regular search and collection work without AI.
-
-## Data and development
-
-Data lives in `data/plugin_data/astrbot_plugin_memeharbor/`. The internal `library_v2.sqlite3` filename identifies the catalog format; the **MemeHarbor product version starts at 1.0.0**.
-
-```bash
-python -m pip install -r requirements-dev.txt
-python -m pytest tests/test_library.py -q
-python -m ruff check .
-node tests/test_gallery.cjs
-```
-
-Runtime integration tests require an AstrBot environment. Set `ASTRBOT_SOURCE` to a framework checkout and run `tests/test_runtime.py` in its virtualenv. Automated tests use temporary data, simulated events, loopback HTTP and stubbed AI responses. They do not message real groups or call paid models. See [CONTRIBUTING.md](CONTRIBUTING.md).
-
-## Credits and provenance
-
-Maintained by **[Ghostberry / horizoe10](https://github.com/horizoe10)**. MemeHarbor grew from the supplied **[Image Replay](https://github.com/cumany/astrbot_plugin_image_replay)** plugin by **cuman / cumany**, whose README also credits [Custom Menu](https://github.com/Futureppo/astrbot_plugin_custom_menu). The catalog, gallery, preview, routing fixes, migration and optional AI workflows are independently maintained here. This is not an official upstream release.
-
-The supplied upstream package did not include a standalone license file. No blanket relicensing of upstream material is asserted by this repository. See [NOTICE](NOTICE).
+提供的原始安装包没有独立许可证文件，本仓库不对上游代码作整体重新授权声明。参见 [NOTICE](NOTICE)。
