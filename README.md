@@ -1,10 +1,10 @@
 <p align="center"><img src="logo.png" width="150" alt="MemeHarbor"></p>
-<h1 align="center">MemeHarbor · 表情港湾</h1>
+<h1 align="center">表情港湾 MemeHarbor</h1>
 <p align="center"><strong>收一次，找得快，每次都有新回应。</strong></p>
-<p align="center">面向 AstrBot 各群聊平台的跨平台表情库 · v1.0</p>
+<p align="center">表情包收集 · 群聊斗图 · 多标签搜图 · 随机发图 · 可视化图库<br>面向 AstrBot 各群聊平台 · v1.0</p>
 <p align="center"><a href="#旧版迁移">旧版迁移</a> · <a href="https://github.com/horizoe10/astrbot_plugin_memeharbor/issues">反馈问题</a></p>
 
-聊天里的好表情，不该淹没在文件夹里。MemeHarbor 把收集、检索和发送连成一个流程：给图片打多个标签，翻看带编号的预览，再把合适的原图发回群里。随机斗图会优先避开本群近期发过的图片。
+群里看到好图就收下，想斗图时按标签找出来。**表情港湾 MemeHarbor** 把表情包收集、多标签搜图和随机发图连成一个流程：给图片打多个标签，翻看带编号的预览，再把合适的原图发回群里。随机斗图会优先避开本群近期发过的图片，让收藏的好图随叫随到。
 
 MemeHarbor 面向所有通过 AstrBot 接入的群聊，基于 AstrBot 的统一消息接口收集和发送图片。平台接入由 AstrBot 适配器负责，具体的图片、引用和消息发送能力以所用适配器为准。
 
@@ -26,7 +26,7 @@ MemeHarbor 面向所有通过 AstrBot 接入的群聊，基于 AstrBot 的统一
 https://github.com/horizoe10/astrbot_plugin_memeharbor
 ```
 
-也可通过仓库 **Code → Download ZIP** 下载，再本地安装。安装后在机器人对应的配置文件中启用 **MemeHarbor**。
+也可通过仓库 **Code → Download ZIP** 下载，再本地安装。安装后在机器人对应的配置文件中启用 **表情港湾 MemeHarbor**。
 
 旧版用户请先备份并停用 Image Replay。新标识为 `astrbot_plugin_memeharbor`，首次空目录安装会复制旧图库，原始数据保留。
 
@@ -83,7 +83,7 @@ https://github.com/horizoe10/astrbot_plugin_memeharbor
 
 ## 网页图库与备份
 
-入口：**插件详情 → Pages → MemeHarbor**。登录面板后即可浏览、批量整理、下载原图和恢复回收站。新上传的图使用“待整理”标签。
+入口：**插件详情 → Pages → 表情港湾 MemeHarbor · 图库管理**。登录面板后即可浏览、批量整理、下载原图和恢复回收站。新上传的图使用“待整理”标签。
 
 ZIP 导入按内容合并，编号可能变化，不是原地回滚；已有图片的描述和回收站状态不会被覆盖。ZIP 上传最多30MB，展开最多150MB、1000张；大图库请直接备份整个数据目录。回收站不会自动清空。
 

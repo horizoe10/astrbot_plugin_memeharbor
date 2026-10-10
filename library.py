@@ -440,7 +440,7 @@ def render_preview(library, items, query, page, pages, total):
     rows = (len(items) + columns - 1) // columns
     canvas = Image.new("RGB", (960, 122 + rows * 290), "#eef2f8")
     draw = ImageDraw.Draw(canvas)
-    title = "MemeHarbor · " + (query[:60] or "全部图片")
+    title = "表情港湾 MemeHarbor · " + (query[:60] or "全部图片")
     while draw.textlength(title, font=font(27)) > 910:
         title = title[:-2] + "…"
     draw.text(

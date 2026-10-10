@@ -50,7 +50,7 @@ COMMANDS = {
     "识图",
     "AI搜图",
 }
-HELP = """MemeHarbor 1.0
+HELP = """表情港湾 MemeHarbor 1.0
 收集 猫 憋笑 ＋图片（也支持引用图片）
 搜图 猫 憋笑：同时包含；搜图 猫 -伤心：排除
 搜图 猫 | 狗：任一条件；查看图片：浏览全部
@@ -63,13 +63,13 @@ HELP = """MemeHarbor 1.0
 删除图片 12 / 回收站 / 恢复图片 12
 识图 12 / AI搜图 一只生气的猫（AI需启用）
 按当前群聊平台的方式唤醒机器人；也可先“收集 标签”，60秒内再发送图片。
-网页图库：插件详情 → Pages → MemeHarbor。"""
+网页图库：插件详情 → Pages → 表情港湾 MemeHarbor。"""
 
 
 @register(
     PLUGIN,
     "Ghostberry",
-    "MemeHarbor 跨平台群聊表情库：搜图、分页预览、标签管理与防重复发送",
+    "表情港湾 MemeHarbor：跨平台表情包收集与斗图助手，多标签搜图、随机发图与可视化图库管理",
     VERSION,
 )
 class MemeHarborPlugin(Star, GalleryAPI):
