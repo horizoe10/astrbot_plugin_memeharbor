@@ -1,0 +1,7 @@
+name: astrbot_plugin_memeharbor
+display_name: MemeHarbor
+author: Ghostberry
+version: "1.0.0"
+desc: Collect once. Find fast. Reply fresh. QQ Official-first meme collections with tag search, preview pages, a web gallery and optional AI.
+repo: https://github.com/horizoe10/astrbot_plugin_memeharbor
+astrbot_version: ">=4.29.0b1,<5"

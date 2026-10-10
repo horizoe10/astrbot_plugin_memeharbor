@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MemeHarbor</title><link rel="stylesheet" href="./style.css"></head>
+<body>
+  <main>
+    <header><div><span class="eyebrow">MEMEHARBOR · 1.0</span><h1>MemeHarbor</h1><p>找到表情，记住编号，随时接梗。</p></div><button id="export" class="secondary">导出备份</button></header>
+    <section class="toolbar" aria-label="搜索和上传">
+      <form id="search"><input id="query" placeholder="标签组合：猫 憋笑 · 排除：猫 -伤心 · 或：猫 | 狗" aria-label="搜索图库"><button>搜索</button></form>
+      <label class="upload">导入图片 / 备份<input id="upload" type="file" accept="image/png,image/jpeg,image/gif,image/webp,image/bmp,.zip" multiple></label>
+    </section>
+    <div class="tabs"><button id="active" class="tab selected">全部图片</button><button id="trash" class="tab">回收站</button><span id="stats"></span><button id="rename" class="link">重命名 / 合并标签</button></div>
+    <section class="batch" aria-label="批量管理"><label><input id="select-all" type="checkbox"> 本页全选</label><span id="selected">已选 0 张</span><input id="batch-tags" placeholder="输入标签，用空格分隔" aria-label="批量标签"><button data-action="add" class="secondary">添加标签</button><button data-action="remove" class="secondary">移除标签</button><button id="recycle" class="danger" data-action="delete">移入回收站</button></section>
+    <p id="status" role="status" aria-live="polite"></p>
+    <section id="grid" class="grid" aria-label="图片列表"></section>
+    <footer><button id="prev" class="secondary">上一页</button><span id="page"></span><button id="next" class="secondary">下一页</button></footer>
+    <aside>群聊发送「搜图 标签」可查看带编号的预览；发送「发图 编号」调用原图。GIF 预览为静态首帧，原图保持动图。回收站不会自动清空。</aside>
+  </main>
+  <dialog id="editor"><form method="dialog"><h2 id="edit-title"></h2><p id="edit-caption"></p><label>标签（空格分隔）<input id="edit-tags"></label><p id="ai-result"></p><div class="dialog-actions"><button id="describe" type="button" class="secondary">AI 建议标签</button><button id="accept-ai" type="button" class="secondary" hidden>采纳建议到输入框</button><button id="save-edit" type="button">保存标签</button><button class="secondary">关闭</button></div><p class="hint">AI 需在插件配置中启用并指定模型；点击识别会将该图片发送给你配置的模型。</p></form></dialog>
+  <dialog id="rename-dialog"><form method="dialog"><h2>重命名 / 合并标签</h2><p>作用于全部在用图片；若新标签已存在，会合并标签。</p><label>原标签<input id="old-tag" required></label><label>新标签<input id="new-tag" required></label><div class="dialog-actions"><button id="confirm-rename" type="button">应用</button><button class="secondary">取消</button></div></form></dialog>
+  <dialog id="confirm-dialog"><form method="dialog"><h2>移入回收站</h2><p id="confirm-message"></p><div class="dialog-actions"><button value="yes" class="danger">确认移入</button><button value="no" class="secondary">取消</button></div></form></dialog>
+  <script type="module" src="./app.js"></script>
+</body></html>
