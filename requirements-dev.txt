@@ -1,5 +1,0 @@
--r requirements.txt
-pytest>=8.4
-pytest-asyncio>=1.1
-PyYAML>=6
-ruff>=0.12

@@ -2,7 +2,7 @@
 <h1 align="center">MemeHarbor · 表情港湾</h1>
 <p align="center"><strong>收一次，找得快，每次都有新回应。</strong></p>
 <p align="center">面向 QQ 官方机器人的 AstrBot 群聊表情库 · v1.0</p>
-<p align="center"><a href="README.en.md">English</a> · <a href="docs/MIGRATION.md">旧版迁移</a> · <a href="https://github.com/horizoe10/astrbot_plugin_memeharbor/issues">反馈问题</a></p>
+<p align="center"><a href="#旧版迁移">旧版迁移</a> · <a href="https://github.com/horizoe10/astrbot_plugin_memeharbor/issues">反馈问题</a></p>
 
 聊天里的好表情，不该淹没在文件夹里。MemeHarbor 把收集、检索和发送连成一个流程：给图片打多个标签，翻看带编号的预览，再把合适的原图发回群里。随机斗图会优先避开本群近期发过的图片。
 
@@ -26,7 +26,17 @@ https://github.com/horizoe10/astrbot_plugin_memeharbor
 
 也可通过仓库 **Code → Download ZIP** 下载，再本地安装。安装后在机器人对应的配置文件中启用 **MemeHarbor**。
 
-旧版用户请先备份并停用 Image Replay。新标识为 `astrbot_plugin_memeharbor`，首次空目录安装会复制旧图库，原始数据保留。[迁移步骤](docs/MIGRATION.md)。
+旧版用户请先备份并停用 Image Replay。新标识为 `astrbot_plugin_memeharbor`，首次空目录安装会复制旧图库，原始数据保留。
+
+## 旧版迁移
+
+1. 备份 `data/plugin_data/astrbot_plugin_image_replay/` 整个目录和旧插件配置。
+2. 停用旧插件，再安装 MemeHarbor，避免两套插件同时响应相同命令。
+3. 在机器人对应的配置文件中启用 MemeHarbor；原来只启用了旧插件的配置不会自动加入新插件。
+4. 首次启动且新数据目录为空时，会复制旧图库和索引；SQLite 使用备份接口复制，原数据保留。已有 v2 图库的编号、标签、描述和回收站状态会保留。
+5. 旧配置中已知的设置，仅在新配置对应项仍为默认值时继承。迁移后请检查唤醒、权限和自定义指令设置，并试发一张图片。
+
+非空的新图库不会自动覆盖。ZIP 导入适合合并图库；需要回滚时，请停用插件后恢复完整数据目录备份。
 
 ## 三步开始
 
@@ -84,4 +94,4 @@ ZIP 导入按内容合并，编号可能变化，不是原地回滚；已有图�
 
 由 **[Ghostberry / horizoe10](https://github.com/horizoe10)** 独立维护。项目从用户提供的 **[cuman / cumany 的 Image Replay](https://github.com/cumany/astrbot_plugin_image_replay)** 演进，上游 README 另注明受 [Custom Menu](https://github.com/Futureppo/astrbot_plugin_custom_menu) 启发。本项目保留来源记录，并非上游官方版本。
 
-提供的原始安装包没有独立许可证文件，本仓库不对上游代码作整体重新授权声明。参见 [NOTICE](NOTICE)。
+提供的原始安装包没有独立许可证文件，本仓库不对上游代码作整体重新授权声明。Logo 使用 OpenAI 图像生成工具制作。
