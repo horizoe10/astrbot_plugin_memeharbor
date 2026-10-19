@@ -21,7 +21,7 @@ from .migration import LEGACY_NAME, import_legacy_library
 from .web_api import GalleryAPI
 
 PLUGIN = "astrbot_plugin_memeharbor"
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 COMMANDS = {
     "收集",
     "添加图片",
@@ -50,7 +50,7 @@ COMMANDS = {
     "识图",
     "AI搜图",
 }
-HELP = """表情港湾 MemeHarbor 1.0.1
+HELP = """表情港湾 MemeHarbor 1.1.0
 收集 猫 憋笑 ＋图片（也支持引用图片）
 搜图 猫 憋笑：同时包含；搜图 猫 -伤心：排除
 搜图 猫 | 狗：任一条件；查看图片：浏览全部

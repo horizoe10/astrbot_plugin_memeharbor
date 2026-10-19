@@ -3,11 +3,13 @@
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>表情港湾 MemeHarbor</title><link rel="stylesheet" href="./style.css"></head>
 <body>
   <main>
-    <header><div><span class="eyebrow">MEMEHARBOR · 1.0</span><h1>表情港湾 MemeHarbor</h1><p>把好图收进港湾，斗图时随叫随到。</p></div><button id="export" class="secondary">导出备份</button></header>
+    <header><div><span class="eyebrow">MEMEHARBOR · 1.1.0</span><h1>表情港湾 MemeHarbor</h1><p>把好图收进港湾，斗图时随叫随到。</p></div><button id="export" class="secondary">导出备份</button></header>
     <section class="toolbar" aria-label="搜索和上传">
       <form id="search"><input id="query" placeholder="标签组合：猫 憋笑 · 排除：猫 -伤心 · 或：猫 | 狗" aria-label="搜索图库"><button>搜索</button></form>
-      <label class="upload">导入图片 / 备份<input id="upload" type="file" accept="image/png,image/jpeg,image/gif,image/webp,image/bmp,.zip" multiple></label>
+      <label class="upload">导入图片 / ZIP<input id="upload" type="file" accept="image/png,image/jpeg,image/gif,image/webp,image/bmp,.zip" multiple></label>
+      <label class="upload">导入整个文件夹<input id="upload-folder" type="file" webkitdirectory multiple></label>
     </section>
+    <p class="hint">支持普通图片 ZIP、插件备份和文件夹（含子文件夹），不限制图片数量。新图片标记为“待整理”，重复图片自动合并；ZIP 最大 30 MB、展开图片最大 150 MB，大图库可选择文件夹逐张导入。</p>
     <div class="tabs"><button id="active" class="tab selected">全部图片</button><button id="trash" class="tab">回收站</button><span id="stats"></span><button id="rename" class="link">重命名 / 合并标签</button></div>
     <section class="batch" aria-label="批量管理"><label><input id="select-all" type="checkbox"> 本页全选</label><span id="selected">已选 0 张</span><input id="batch-tags" placeholder="输入标签，用空格分隔" aria-label="批量标签"><button data-action="add" class="secondary">添加标签</button><button data-action="remove" class="secondary">移除标签</button><button id="recycle" class="danger" data-action="delete">移入回收站</button></section>
     <p id="status" role="status" aria-live="polite"></p>

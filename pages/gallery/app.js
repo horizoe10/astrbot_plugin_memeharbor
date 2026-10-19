@@ -76,10 +76,32 @@ $('accept-ai').onclick = () => { $('edit-tags').value = [...new Set([...$('edit-
 $('rename').onclick = () => $('rename-dialog').showModal();
 $('confirm-rename').onclick = () => run(async () => { const result = await bridge.apiPost('action', { action: 'rename', old: $('old-tag').value.trim(), new: $('new-tag').value.trim() }); $('rename-dialog').close(); await load(); status(result.message); });
 $('export').onclick = () => run(async () => { status('正在打包图片和标签…'); await bridge.download('export', {}, 'memeharbor-backup.zip'); status('备份已导出'); });
-$('upload').onchange = () => run(async () => {
-  const files = [...$('upload').files]; let count = 0; const failed = [];
-  for (const file of files) { status(`正在导入 ${count + failed.length + 1}/${files.length}：${file.name}`); try { await bridge.upload('upload', file); count++; } catch (error) { failed.push(`${file.name}：${error.message}`); } }
-  $('upload').value = ''; await load(); status(`成功导入 ${count} 个文件${failed.length ? '；失败：' + failed.join('；') : '，新图片使用“待整理”标签。'}`, failed.length > 0);
-});
+async function importFiles(input, folder = false) {
+  if (!input.files.length) return;
+  const files = [...input.files];
+  let added = 0, duplicates = 0, skipped = 0, failed = 0, completed = 0;
+  const errors = [];
+  $('upload').disabled = $('upload-folder').disabled = true;
+  try {
+    for (const file of files) {
+      const name = file.webkitRelativePath || file.name;
+      if (folder && (!/\.(png|jpe?g|gif|webp|bmp)$/i.test(file.name) || name.split('/').some(part => part === '__MACOSX' || part.startsWith('._')))) { skipped++; completed++; continue; }
+      status(`正在导入 ${++completed}/${files.length}：${name}（已新增 ${added} 张）`);
+      try {
+        const result = await bridge.upload('upload', file);
+        added += result.added; duplicates += result.duplicates; skipped += result.skipped; failed += result.failed;
+        for (const error of result.errors || []) { if (errors.length < 20) errors.push(`${name}：${error}`); }
+      } catch (error) { failed++; if (errors.length < 20) errors.push(`${name}：${error.message}`); }
+    }
+    const summary = `导入完成：新增 ${added} 张，重复合并 ${duplicates} 张，跳过 ${skipped} 个非图片文件，失败 ${failed} 项。`;
+    try { await load(); } catch (error) { errors.push(`刷新图库失败：${error.message}`); }
+    status(summary + (errors.length ? ' 详情（最多20条）：' + errors.slice(0, 20).join('；') : ' 新图片使用“待整理”标签。'), failed > 0 || errors.length > 0);
+  } finally {
+    input.value = '';
+    $('upload').disabled = $('upload-folder').disabled = false;
+  }
+}
+$('upload').onchange = () => run(() => importFiles($('upload')));
+$('upload-folder').onchange = () => run(() => importFiles($('upload-folder'), true));
 if (!bridge) { status('请从 AstrBot 插件详情 → Pages 打开本图库。', true); }
 else { run(async () => { await bridge.ready(); await load(); }); }

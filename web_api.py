@@ -137,7 +137,7 @@ class GalleryAPI:
             files = await request.files()
             upload = files.get("file")
             if upload is None:
-                raise ValueError("请选择图片或本插件导出的 ZIP 备份")
+                raise ValueError("请选择图片、普通图片 ZIP 或本插件备份")
             is_zip = str(upload.filename or "").lower().endswith(".zip")
             limit = 30 * 1048576 if is_zip else self.library.max_bytes
             data = await upload.read(limit + 1)
@@ -147,13 +147,15 @@ class GalleryAPI:
                 if is_zip:
                     temporary = self.library.cache / f"import-{uuid.uuid4().hex}.zip"
                     await asyncio.to_thread(temporary.write_bytes, data)
-                    mapping = await asyncio.to_thread(
-                        self.library.import_archive, temporary
+                    report = await asyncio.to_thread(
+                        self.library.import_upload_archive,
+                        temporary,
+                        "web:" + request.username,
                     )
                     return json_response(
                         {
-                            "message": f"已合并导入 {len(mapping)} 张图片（编号以当前图库为准）",
-                            "mapping": mapping,
+                            "message": f"已处理 {report['imported']} 张图片，新增 {report['added']} 张，重复合并 {report['duplicates']} 张，跳过 {report['skipped']} 个文件，失败 {report['failed']} 张",
+                            **report,
                         }
                     )
                 item, duplicate = await asyncio.to_thread(
@@ -163,13 +165,19 @@ class GalleryAPI:
                     {
                         "message": f"#{item['id']} {'已合并标签' if duplicate else '已收集'}",
                         "id": item["id"],
+                        "imported": 1,
+                        "added": int(not duplicate),
+                        "duplicates": int(duplicate),
+                        "skipped": 0,
+                        "failed": 0,
+                        "errors": [],
                     }
                 )
         except Exception as exc:
             return error_response(
                 str(exc)
                 if isinstance(exc, ValueError)
-                else "导入失败，请确认文件完整且是支持的图片或本插件备份",
+                else "导入失败，请确认文件完整且是支持的图片、普通图片 ZIP 或本插件备份",
                 status_code=400,
             )
         finally:

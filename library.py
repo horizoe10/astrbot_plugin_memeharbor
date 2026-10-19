@@ -9,12 +9,13 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import time
 import uuid
 import zipfile
 from contextlib import contextmanager
 from functools import lru_cache
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
@@ -366,8 +367,6 @@ class Library:
                 manifest.get("images"), list
             ):
                 raise ValueError("仅支持本插件导出的 v2 备份")
-            if len(manifest["images"]) > 1000:
-                raise ValueError("单次导入最多 1000 张图片")
             total = 0
             for item in manifest["images"]:
                 filename = item["filename"]
@@ -381,25 +380,114 @@ class Library:
                 total += info.file_size
                 if info.file_size > self.max_bytes or total > 150 * 1048576:
                     raise ValueError("备份解压后超过 150 MB 或单图大小限制")
-                data = archive.read(info)
+                data = self.read_archive_image(archive, info)
                 inspect_image(data, self.max_bytes)
                 tags = tags_from(item.get("tags", []))
-                pending.append((data, tags, item))
-        mappings = []
-        for data, tags, old in pending:
-            item, duplicate = self.add(
-                data,
-                tags,
-                str(old.get("owner", "")),
-                str(old.get("origin", "")),
-                restore_duplicate=False,
-            )
-            if not duplicate:
-                self.annotate(item["id"], old.get("caption", ""), old.get("ocr", ""))
-                if old.get("deleted"):
-                    self.recycle([item["id"]])
-            mappings.append({"old": old.get("id"), "new": item["id"]})
+                pending.append((info, tags, item))
+            mappings = []
+            for info, tags, old in pending:
+                item, duplicate = self.add(
+                    self.read_archive_image(archive, info),
+                    tags,
+                    str(old.get("owner", "")),
+                    str(old.get("origin", "")),
+                    restore_duplicate=False,
+                )
+                if not duplicate:
+                    self.annotate(
+                        item["id"], old.get("caption", ""), old.get("ocr", "")
+                    )
+                    if old.get("deleted"):
+                        self.recycle([item["id"]])
+                mappings.append(
+                    {"old": old.get("id"), "new": item["id"], "duplicate": duplicate}
+                )
         return mappings
+
+    def read_archive_image(self, archive, info):
+        name = info.filename.replace("\\", "/")
+        parts = PurePosixPath(name)
+        if parts.is_absolute() or ".." in parts.parts or ":" in name:
+            raise ValueError("压缩包中有非法路径")
+        if stat.S_ISLNK(info.external_attr >> 16):
+            raise ValueError("不支持压缩包中的符号链接")
+        if info.flag_bits & 1:
+            raise ValueError("请先解除 ZIP 密码保护")
+        if info.file_size > self.max_bytes:
+            raise ValueError("图片超过单张大小限制")
+        # Read each member with a bound; never extract user-controlled paths.
+        with archive.open(info) as stream:
+            data = stream.read(self.max_bytes + 1)
+        inspect_image(data, self.max_bytes)
+        return data
+
+    def import_upload_archive(self, path, owner=""):
+        with zipfile.ZipFile(path) as archive:
+            if "manifest.json" in archive.namelist():
+                # A recognized backup keeps its metadata; unrelated JSON in an
+                # ordinary image ZIP does not prevent importing its images.
+                info = archive.getinfo("manifest.json")
+                if info.file_size > 5 * 1048576:
+                    raise ValueError("备份索引过大")
+                try:
+                    manifest = json.loads(archive.read(info))
+                except (ValueError, UnicodeError):
+                    manifest = None
+                if (
+                    isinstance(manifest, dict)
+                    and "version" in manifest
+                    and "images" in manifest
+                ):
+                    mapping = self.import_archive(path)
+                    duplicates = sum(item["duplicate"] for item in mapping)
+                    return dict(
+                        imported=len(mapping),
+                        added=len(mapping) - duplicates,
+                        duplicates=duplicates,
+                        skipped=0,
+                        failed=0,
+                        errors=[],
+                    )
+            report = dict(
+                imported=0, added=0, duplicates=0, skipped=0, failed=0, errors=[]
+            )
+            candidates = []
+            total = 0
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                parts = PurePosixPath(info.filename.replace("\\", "/"))
+                if (
+                    "__MACOSX" in parts.parts
+                    or parts.name.startswith("._")
+                    or parts.suffix.lower() not in {*EXTENSIONS.values(), ".jpeg"}
+                ):
+                    report["skipped"] += 1
+                    continue
+                candidates.append(info)
+                total += info.file_size
+            if total > 150 * 1048576:
+                raise ValueError(
+                    "ZIP 图片解压后超过 150 MB，请分包导入或使用文件夹导入"
+                )
+            for info in candidates:
+                try:
+                    data = self.read_archive_image(archive, info)
+                    _, duplicate = self.add(data, ["待整理"], owner, "web")
+                except (
+                    ValueError,
+                    OSError,
+                    RuntimeError,
+                    zipfile.BadZipFile,
+                    NotImplementedError,
+                ) as exc:
+                    report["failed"] += 1
+                    if len(report["errors"]) < 20:
+                        report["errors"].append(f"{info.filename}：{exc}")
+                    continue
+                report["imported"] += 1
+                report["duplicates" if duplicate else "added"] += 1
+            return report
 
     def cleanup_cache(self):
         for path in self.cache.iterdir():
