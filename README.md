@@ -1,7 +1,7 @@
 <p align="center"><img src="logo.png" width="150" alt="MemeHarbor"></p>
 <h1 align="center">表情港湾 MemeHarbor</h1>
 <p align="center"><strong>收一次，找得快，每次都有新回应。</strong></p>
-<p align="center">表情包收集 · 群聊斗图 · 多标签搜图 · 随机发图 · 可视化图库<br>面向 AstrBot 各群聊平台 · v1.0</p>
+<p align="center">表情包收集 · 群聊斗图 · 多标签搜图 · 随机发图 · 可视化图库<br>面向 AstrBot 各群聊平台 · v1.0.1</p>
 <p align="center"><a href="#旧版迁移">旧版迁移</a> · <a href="https://github.com/horizoe10/astrbot_plugin_memeharbor/issues">反馈问题</a></p>
 
 群里看到好图就收下，想斗图时按标签找出来。**表情港湾 MemeHarbor** 把表情包收集、多标签搜图和随机发图连成一个流程：给图片打多个标签，翻看带编号的预览，再把合适的原图发回群里。随机斗图会优先避开本群近期发过的图片，让收藏的好图随叫随到。
