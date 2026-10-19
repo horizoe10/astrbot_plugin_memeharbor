@@ -52,6 +52,8 @@ https://github.com/horizoe10/astrbot_plugin_memeharbor
 
 `12` 请替换为预览里的真实编号。`/memeharbor` 或 `斗图帮助` 查看帮助，也支持 `/memeharbor 搜图 猫`。
 
+收集和网页批量上传不限制图片数量；群聊中会处理平台实际提供的全部图片。旧配置中的 `max_collect_count` 不再生效。单张图片的大小限制仍由 `max_image_mb` 控制。
+
 | 想做什么 | 发送什么 |
 |---|---|
 | 多标签同时满足 | `搜图 猫 憋笑` |

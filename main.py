@@ -315,9 +315,7 @@ class MemeHarborPlugin(Star, GalleryAPI):
         if self.config.get("collect_admin_only", False) and not self.admin(event):
             raise ValueError("当前仅允许管理员收集图片")
         labels = tags_from(args) or ["临时"]
-        images, errors, skipped = await self.media.load(
-            event, self.number("max_collect_count", 3, 1, 6)
-        )
+        images, errors = await self.media.load(event)
         if not images:
             if errors:
                 raise ValueError(
@@ -347,10 +345,8 @@ class MemeHarborPlugin(Star, GalleryAPI):
                     f"#{item['id']} {'已有图片，已合并标签' if duplicate else '收集成功'}：{'、'.join(item['tags'])}"
                 )
         self.pending.pop(self.user_key(event), None)
-        if errors or skipped:
-            results.append(
-                f"另有 {len(errors)} 张读取失败，{skipped} 张超过单次收集上限。"
-            )
+        if errors:
+            results.append(f"另有 {len(errors)} 张读取失败。")
         results.append("发送“搜图 " + labels[0] + "”预览，或“发图 编号”调用。")
         await self.say(event, "\n".join(results))
 

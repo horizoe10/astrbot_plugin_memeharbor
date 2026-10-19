@@ -106,7 +106,7 @@ class MediaLoader:
 
         attachments = []
         if str(field(raw, "message_type", "")) == "103":
-            for element in (field(raw, "msg_elements", []) or [])[:1]:
+            for element in field(raw, "msg_elements", []) or []:
                 attachments.extend(field(element, "attachments", []) or [])
         if not attachments:
             attachments = field(raw, "attachments", []) or []
@@ -125,10 +125,10 @@ class MediaLoader:
                 result.append(url)
         return result
 
-    async def load(self, event, limit=3):
+    async def load(self, event):
         result, errors = [], []
         segments = self.image_segments(event)
-        for segment in segments[:limit]:
+        for segment in segments:
             candidates = list(
                 dict.fromkeys(
                     s
@@ -173,7 +173,7 @@ class MediaLoader:
                     type(last_error).__name__ if last_error else "缺少图片地址"
                 )
         if not segments:
-            for url in self.raw_urls(event)[:limit]:
+            for url in self.raw_urls(event):
                 try:
                     result.append(await self.read(url))
                 except (TimeoutError, OSError, ValueError, aiohttp.ClientError) as exc:
@@ -190,7 +190,7 @@ class MediaLoader:
                         self.timeout,
                     )
                     for node in payload.get("message", []):
-                        if node.get("type") != "image" or len(result) >= limit:
+                        if node.get("type") != "image":
                             continue
                         source = node.get("data", {})
                         if source.get("url"):
@@ -207,4 +207,4 @@ class MediaLoader:
                             )
                 except Exception as exc:
                     errors.append(type(exc).__name__)
-        return result, errors, max(0, len(segments) - limit)
+        return result, errors

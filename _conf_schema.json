@@ -7,7 +7,6 @@
   "max_send_count": {"description": "每次最多发送原图数量，1～3；请结合当前平台的发送频率限制设置。", "type": "int", "default": 3},
   "recent_window": {"description": "每个群/会话记住最近多少次发送，优先避开这些图片；图库不足时从最久未发的图片开始轮换。", "type": "int", "default": 10},
   "send_cooldown": {"description": "同一用户在同一会话发图的冷却秒数，0～60。", "type": "int", "default": 2},
-  "max_collect_count": {"description": "单次最多收集几张图片，1～6。", "type": "int", "default": 3},
   "max_image_mb": {"description": "单张图片大小限制，1～30 MB。", "type": "int", "default": 15},
   "download_timeout": {"description": "单次图片下载最长等待秒数，5～60。", "type": "int", "default": 20},
   "download_use_proxy": {"description": "图片下载继承 AstrBot 的 HTTP 代理环境设置。", "type": "bool", "default": true},
