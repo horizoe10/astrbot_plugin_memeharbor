@@ -21,9 +21,11 @@ from .migration import LEGACY_NAME, import_legacy_library
 from .web_api import GalleryAPI
 
 PLUGIN = "astrbot_plugin_memeharbor"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 COMMANDS = {
     "收集",
+    "导入记录",
+    "收集记录",
     "添加图片",
     "添加表情",
     "取消收集",
@@ -50,8 +52,9 @@ COMMANDS = {
     "识图",
     "AI搜图",
 }
-HELP = """表情港湾 MemeHarbor 1.1.0
+HELP = """表情港湾 MemeHarbor 1.2.0
 收集 猫 憋笑 ＋图片（也支持引用图片）
+导入记录 猫 憋笑：引用聊天记录，批量收集其中图片（需平台支持读取）
 搜图 猫 憋笑：同时包含；搜图 猫 -伤心：排除
 搜图 猫 | 狗：任一条件；查看图片：浏览全部
 下一页 / 上一页 / 图片翻页 2（每人独立）
@@ -62,7 +65,7 @@ HELP = """表情港湾 MemeHarbor 1.1.0
 标签重命名 旧 新 / 标签合并 旧 新（管理员）
 删除图片 12 / 回收站 / 恢复图片 12
 识图 12 / AI搜图 一只生气的猫（AI需启用）
-按当前群聊平台的方式唤醒机器人；也可先“收集 标签”，60秒内再发送图片。
+按当前群聊平台的方式唤醒机器人；也可先“收集 标签”，60秒内再发送图片或聊天记录。
 网页图库：插件详情 → Pages → 表情港湾 MemeHarbor。"""
 
 
@@ -245,9 +248,7 @@ class MemeHarborPlugin(Star, GalleryAPI):
             self.pending.pop(key, None)
             pending = None
         try:
-            if pending and (
-                self.media.image_segments(event) or self.media.raw_urls(event)
-            ):
+            if pending and self.media.has_media(event):
                 event.stop_event()
                 await self.collect(event, pending[1], allow_pending=False)
                 return
@@ -319,7 +320,7 @@ class MemeHarborPlugin(Star, GalleryAPI):
         if not images:
             if errors:
                 raise ValueError(
-                    "图片下载或识别失败，可能已过期、超时或过大。请重新发送原图后再收集。"
+                    "未能收集图片：" + "；".join(dict.fromkeys(errors[:3]))
                 )
             if allow_pending:
                 self.remember(
@@ -331,11 +332,12 @@ class MemeHarborPlugin(Star, GalleryAPI):
                     event,
                     "已等待收图，标签："
                     + "、".join(labels)
-                    + "。请在60秒内 @机器人发送图片；发送“取消收集”可取消。引用消息未提供原图时请直接重发图片。",
+                    + "。请在60秒内按当前平台唤醒方式发送图片或聊天记录；发送“取消收集”可取消。平台未提供记录内容时，请展开后发送图片。",
                 )
                 return
             raise ValueError("没有取得图片，请直接发送图片和收集命令")
         results = []
+        added = merged = 0
         async with self.mutation:
             for data in images:
                 item, duplicate = await asyncio.to_thread(
@@ -344,9 +346,20 @@ class MemeHarborPlugin(Star, GalleryAPI):
                 results.append(
                     f"#{item['id']} {'已有图片，已合并标签' if duplicate else '收集成功'}：{'、'.join(item['tags'])}"
                 )
+                if duplicate:
+                    merged += 1
+                else:
+                    added += 1
+        if len(results) > 20:
+            results = [
+                f"已处理 {len(images)} 张图片，新增 {added} 张，重复合并 {merged} 张。标签：{'、'.join(labels)}"
+            ]
         self.pending.pop(self.user_key(event), None)
         if errors:
-            results.append(f"另有 {len(errors)} 张读取失败。")
+            results.append(
+                f"另有 {len(errors)} 项图片或记录读取失败："
+                + "；".join(dict.fromkeys(errors[:3]))
+            )
         results.append("发送“搜图 " + labels[0] + "”预览，或“发图 编号”调用。")
         await self.say(event, "\n".join(results))
 
@@ -462,7 +475,7 @@ class MemeHarborPlugin(Star, GalleryAPI):
     async def dispatch(self, event, command, args):
         if command in {"斗图帮助", "帮助"}:
             await self.say(event, HELP)
-        elif command in {"收集", "添加图片", "添加表情"}:
+        elif command in {"收集", "添加图片", "添加表情", "导入记录", "收集记录"}:
             await self.collect(event, args)
         elif command == "取消收集":
             self.pending.pop(self.user_key(event), None)

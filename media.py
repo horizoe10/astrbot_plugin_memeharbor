@@ -10,9 +10,8 @@ from urllib.request import url2pathname
 
 import aiohttp
 
-from astrbot.api.message_components import Image, Reply
-
 from .library import inspect_image
+from .records import event_sources, expand_records, onebot_action
 
 
 class MediaLoader:
@@ -76,22 +75,18 @@ class MediaLoader:
 
     @staticmethod
     def image_segments(event):
-        chain = event.get_messages() or []
+        return event_sources(event).images
 
-        def walk(items):
-            result = []
-            for segment in items:
-                if isinstance(segment, Image):
-                    result.append(segment)
-                elif isinstance(segment, Reply):
-                    result.extend(walk(getattr(segment, "chain", None) or []))
-            return result
-
-        quoted = []
-        for segment in chain:
-            if isinstance(segment, Reply):
-                quoted.extend(walk(getattr(segment, "chain", None) or []))
-        return quoted or walk(chain)
+    @staticmethod
+    def has_media(event):
+        sources = event_sources(event)
+        return bool(
+            sources.images
+            or sources.forwards
+            or sources.replies
+            or sources.is_record
+            or MediaLoader.raw_urls(event)
+        )
 
     @staticmethod
     def raw_urls(event):
@@ -125,86 +120,83 @@ class MediaLoader:
                 result.append(url)
         return result
 
-    async def load(self, event):
-        result, errors = [], []
-        segments = self.image_segments(event)
-        for segment in segments:
-            candidates = list(
-                dict.fromkeys(
-                    s
-                    for s in (
-                        getattr(segment, "url", None),
-                        getattr(segment, "file", None),
-                    )
-                    if s
+    async def read_segment(self, event, segment):
+        candidates = list(
+            dict.fromkeys(
+                source
+                for source in (
+                    getattr(segment, "url", None),
+                    getattr(segment, "file", None),
+                    getattr(segment, "path", None),
                 )
+                if isinstance(source, str) and source
             )
-            last_error = None
-            for source in candidates:
-                try:
-                    result.append(await self.read(source))
-                    break
-                except (TimeoutError, OSError, ValueError, aiohttp.ClientError) as exc:
-                    last_error = exc
-            else:
-                converter = getattr(segment, "convert_to_base64", None)
-                if converter and not candidates:
-                    try:
-                        converted = converter()
-                        if asyncio.iscoroutine(converted):
-                            converted = await asyncio.wait_for(converted, self.timeout)
-                        if isinstance(converted, bytes):
-                            await asyncio.to_thread(
-                                inspect_image, converted, self.max_bytes
-                            )
-                            result.append(converted)
-                        else:
-                            result.append(
-                                await self.read(
-                                    converted
-                                    if converted.startswith("base64://")
-                                    else "base64://" + converted
-                                )
-                            )
-                        continue
-                    except Exception as exc:
-                        last_error = exc
-                errors.append(
-                    type(last_error).__name__ if last_error else "缺少图片地址"
+        )
+        last_error = None
+        for source in candidates:
+            try:
+                return await self.read(source)
+            except (TimeoutError, OSError, ValueError, aiohttp.ClientError) as exc:
+                last_error = exc
+        file_id = getattr(segment, "file", None)
+        if (
+            event.get_platform_name() == "aiocqhttp"
+            and file_id
+            and not file_id.startswith(
+                ("http:", "https:", "//", "base64:", "data:", "file:")
+            )
+        ):
+            try:
+                detail = await onebot_action(
+                    event, "get_image", [{"file_id": file_id}], self.timeout
                 )
-        if not segments:
+                for source in dict.fromkeys((detail.get("url"), detail.get("file"))):
+                    if source:
+                        try:
+                            return await self.read(source)
+                        except (
+                            TimeoutError,
+                            OSError,
+                            ValueError,
+                            aiohttp.ClientError,
+                        ) as exc:
+                            last_error = exc
+            except Exception as exc:
+                last_error = exc
+        converter = getattr(segment, "convert_to_base64", None)
+        if converter and not candidates:
+            try:
+                converted = converter()
+                if asyncio.iscoroutine(converted):
+                    converted = await asyncio.wait_for(converted, self.timeout)
+                if isinstance(converted, bytes):
+                    await asyncio.to_thread(inspect_image, converted, self.max_bytes)
+                    return converted
+                return await self.read(
+                    converted
+                    if converted.startswith("base64://")
+                    else "base64://" + converted
+                )
+            except Exception as exc:
+                last_error = exc
+        raise ValueError(
+            "图片读取失败："
+            + (type(last_error).__name__ if last_error else "缺少图片地址")
+        ) from last_error
+
+    async def load(self, event):
+        sources = event_sources(event)
+        segments, errors = await expand_records(event, sources, self.timeout)
+        result = []
+        for segment in segments:
+            try:
+                result.append(await self.read_segment(event, segment))
+            except Exception as exc:
+                errors.append(str(exc))
+        if not segments and not sources.is_record:
             for url in self.raw_urls(event):
                 try:
                     result.append(await self.read(url))
                 except (TimeoutError, OSError, ValueError, aiohttp.ClientError) as exc:
-                    errors.append(type(exc).__name__)
-        # Only OneBot exposes get_msg/get_image; never call those on official QQ.
-        if not result and event.get_platform_name() == "aiocqhttp":
-            reply = next(
-                (s for s in event.get_messages() if isinstance(s, Reply)), None
-            )
-            if reply and getattr(reply, "id", None):
-                try:
-                    payload = await asyncio.wait_for(
-                        event.bot.api.call_action("get_msg", message_id=str(reply.id)),
-                        self.timeout,
-                    )
-                    for node in payload.get("message", []):
-                        if node.get("type") != "image":
-                            continue
-                        source = node.get("data", {})
-                        if source.get("url"):
-                            result.append(await self.read(source["url"]))
-                        elif source.get("file"):
-                            detail = await asyncio.wait_for(
-                                event.bot.api.call_action(
-                                    "get_image", file_id=source["file"]
-                                ),
-                                self.timeout,
-                            )
-                            result.append(
-                                await self.read(detail.get("file") or detail.get("url"))
-                            )
-                except Exception as exc:
                     errors.append(type(exc).__name__)
         return result, errors
