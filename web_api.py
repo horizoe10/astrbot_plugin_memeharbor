@@ -1,8 +1,7 @@
-"""Authenticated AstrBot Plugin Pages endpoints for the gallery."""
+"""Authenticated AstrBot Plugin Pages endpoints for the MemeHarbor web app."""
 
 import asyncio
 import base64
-import math
 import uuid
 
 from astrbot.api.web import error_response, file_response, json_response, request
@@ -10,8 +9,7 @@ from astrbot.api.web import error_response, file_response, json_response, reques
 from .library import INBOX_TAGS, SORTS, in_inbox, tags_from
 
 PLUGIN = "astrbot_plugin_memeharbor"
-VIEWS = ("all", "inbox", "trash")
-PAGE_SIZES = (24, 48, 96)
+VIEWS = ("all", "inbox", "trash", "review")
 MAX_BATCH = 10000
 
 
@@ -24,7 +22,14 @@ def origin_label(origin):
         return "早期图库"
     if origin == "web":
         return "网页导入"
+    if origin == "batch_record":
+        return "聊天记录导入"
+    if ":" not in origin:
+        return "早期导入"
     kind, _, chat = origin.rpartition(":")
+    if len(chat) > 14:
+        # QQ official group ids are long hashes; keep both ends readable.
+        chat = f"{chat[:6]}…{chat[-4:]}"
     if kind.endswith(":group"):
         return f"群 {chat}"
     if kind.endswith(":private"):
@@ -32,14 +37,46 @@ def origin_label(origin):
     return origin
 
 
+def light(item):
+    """Card fields without image data; thumbnails are fetched separately."""
+    return {
+        "id": item["id"],
+        "tags": item["tags"],
+        "created": item["created"],
+        "sent": item["sent"],
+        "deleted": item["deleted"],
+        "gif": item["filename"].lower().endswith(".gif"),
+        "inbox": in_inbox(item),
+        "review": bool(item.get("review")),
+        "auto": item["owner"] == "auto",
+        "origin": origin_label(item["origin"]),
+        "width": item.get("width", 0),
+        "height": item.get("height", 0),
+        "frames": item.get("frames", 0),
+    }
+
+
+def quoted(tags):
+    return "".join(f"「{t}」" for t in tags)
+
+
 class GalleryAPI:
     def register_gallery(self, context):
         for endpoint, handler, methods in (
-            ("gallery", self.gallery_list, ["GET"]),
-            ("tags", self.gallery_tags, ["GET"]),
+            ("home", self.web_home, ["GET"]),
+            ("analyze", self.web_analyze, ["POST"]),
+            ("list", self.web_list, ["GET"]),
+            ("thumbs", self.web_thumbs, ["GET"]),
             ("image/<image_id>", self.gallery_image, ["GET"]),
-            ("stats", self.gallery_stats, ["GET"]),
+            ("recommend/<image_id>", self.web_recommend, ["GET"]),
+            ("clusters", self.web_clusters, ["GET"]),
+            ("tags", self.gallery_tags, ["GET"]),
+            ("tag_health", self.web_tag_health, ["GET"]),
+            ("insights", self.web_insights, ["GET"]),
+            ("scopes", self.web_scopes, ["GET"]),
+            ("preview", self.web_preview, ["GET"]),
             ("similar", self.gallery_similar, ["GET"]),
+            ("operations", self.web_operations, ["GET"]),
             ("action", self.gallery_action, ["POST"]),
             ("upload", self.gallery_upload, ["POST"]),
             ("export", self.gallery_export, ["GET"]),
@@ -54,15 +91,19 @@ class GalleryAPI:
         if not request.username:
             raise ValueError("请通过已登录的 AstrBot 管理面板打开图库")
 
+    async def respond(self, build, status=400):
+        """Run a blocking builder off the event loop with the shared error shape."""
+        try:
+            self.check_login()
+            return json_response(await asyncio.to_thread(build))
+        except (ValueError, TypeError, KeyError) as exc:
+            return error_response(str(exc), status_code=status)
+        except OSError:
+            return error_response("读取图库文件失败", status_code=500)
+
     def card(self, item):
-        """Public fields for one image card; thumbnails come from the disk cache."""
-        public = {
-            key: item[key]
-            for key in ("id", "tags", "created", "caption", "ocr", "sent", "deleted")
-        }
-        public["gif"] = item["filename"].lower().endswith(".gif")
-        public["inbox"] = in_inbox(item)
-        public["origin"] = origin_label(item["origin"])
+        public = light(item)
+        public["caption"], public["ocr"] = item["caption"], item["ocr"]
         try:
             public["thumbnail"] = data_url(self.library.thumbnail_data(item))
         except (OSError, ValueError):
@@ -81,108 +122,280 @@ class GalleryAPI:
             view == "trash",
             bool(self.config.get("case_sensitive", False)),
             sort,
+            None,
+            bool(self.config.get("partial_match", True)),
+            view == "review",
         )
         return [item for item in items if in_inbox(item)] if view == "inbox" else items
 
-    async def gallery_list(self):
-        try:
-            self.check_login()
-            query = str(request.query.get("q", ""))
-            view = str(request.query.get("view", "all"))
-            sort = str(request.query.get("sort", "new"))
-            size = request.query.get("page_size", 48, type=int)
-            size = size if size in PAGE_SIZES else 48
-            page = max(1, request.query.get("page", 1, type=int))
+    def counts(self):
+        stats = self.library.stats()
+        return {
+            "all": stats["total"],
+            "inbox": stats["inbox"],
+            "trash": stats["deleted"],
+            "review": stats["review"],
+        }
 
-            def build():
-                items = self.select(query, view, sort)
-                pages = max(1, math.ceil(len(items) / size))
-                current = min(page, pages)
-                stats = self.library.stats()
-                return {
-                    "items": [
-                        self.card(item)
-                        for item in items[(current - 1) * size : current * size]
-                    ],
-                    "total": len(items),
-                    "page": current,
-                    "pages": pages,
-                    "page_size": size,
-                    "counts": {
-                        "all": stats["total"],
-                        "inbox": stats["inbox"],
-                        "trash": stats["deleted"],
-                    },
-                    "ai_enabled": bool(self.config.get("ai_enabled", False)),
-                }
+    # ---------- overview ----------
 
-            return json_response(await asyncio.to_thread(build))
-        except ValueError as exc:
-            return error_response(str(exc), status_code=400)
+    async def web_home(self):
+        def build():
+            with self.library.connect() as connection:
+                pending = connection.execute(
+                    "SELECT COUNT(*) FROM images WHERE phash_checked=0"
+                ).fetchone()[0]
+            stats = self.library.stats()
+            insights = self.library.insights(30)
+            health = self.library.tag_health(30)
+            return {
+                "stats": {k: v for k, v in stats.items() if k != "top_sent"},
+                "analysis_pending": pending,
+                "similar_groups": None
+                if pending
+                else len(self.library.similar_groups()),
+                "searches": insights["searches"],
+                "top_searches": insights["top"][:8],
+                "misses": [m for m in insights["misses"] if not m["now"]][:6],
+                "recent": [
+                    {"origin": origin_label(o), "count": n}
+                    for o, n in self.library.recent_collections(7)[:6]
+                ],
+                "health": {
+                    "duplicates": len(health["duplicates"]),
+                    "singletons": len(health["singletons"]),
+                    "example": health["duplicates"][0]
+                    if health["duplicates"]
+                    else None,
+                },
+                "operations": self.library.operations(5),
+                "ai_enabled": bool(self.config.get("ai_enabled", False)),
+                "library_scope": self.config.get("library_scope", "shared"),
+                "review_mode": bool(self.config.get("review_mode", False)),
+                "last_backup": self.library.last_backup(self.backups),
+                "backup_days": self.number("auto_backup_days", 7, 0, 60),
+            }
 
-    async def gallery_tags(self):
-        try:
-            self.check_login()
-            counts = await asyncio.to_thread(self.library.tag_counts)
-            return json_response(
-                {
-                    "tags": [{"tag": tag, "count": n} for tag, n in counts.items()],
-                    "inbox_tags": list(INBOX_TAGS),
-                }
-            )
-        except ValueError as exc:
-            return error_response(str(exc), status_code=400)
+        return await self.respond(build)
+
+    async def web_analyze(self):
+        # Older images are analysed in small batches; the page calls this until done.
+        return await self.respond(lambda: {"pending": self.library.fill_phashes(40)})
+
+    # ---------- browsing ----------
+
+    async def web_list(self):
+        query = str(request.query.get("q", ""))
+        view = str(request.query.get("view", "all"))
+        sort = str(request.query.get("sort", "new"))
+        offset = max(0, request.query.get("offset", 0, type=int) or 0)
+        limit = min(300, max(1, request.query.get("limit", 120, type=int) or 120))
+
+        def build():
+            items = self.select(query, view, sort)
+            return {
+                "items": [light(i) for i in items[offset : offset + limit]],
+                "total": len(items),
+                "offset": offset,
+                "counts": self.counts(),
+            }
+
+        return await self.respond(build)
+
+    async def web_thumbs(self):
+        raw = str(request.query.get("ids", ""))
+
+        def build():
+            ids = [int(i) for i in raw.split(",") if i.strip().isdigit()][:80]
+            thumbs = {}
+            for image_id in ids:
+                try:
+                    item = self.library.get(image_id, True)
+                    thumbs[str(image_id)] = data_url(self.library.thumbnail_data(item))
+                except (OSError, ValueError):
+                    thumbs[str(image_id)] = None
+            return {"thumbs": thumbs}
+
+        return await self.respond(build)
 
     async def gallery_image(self, image_id):
-        try:
-            self.check_login()
+        def build():
+            item = self.library.get(image_id, True)
+            data, mime, meta = self.library.original_data(item)
+            return dict(
+                self.card(item),
+                preview=data_url(data, mime),
+                owner=item["owner"],
+                **meta,
+            )
 
-            def build():
-                item = self.library.get(image_id, True)
-                data, mime, meta = self.library.original_data(item)
-                return dict(
-                    self.card(item),
-                    preview=data_url(data, mime),
-                    owner=item["owner"],
-                    **meta,
+        return await self.respond(build, status=404)
+
+    async def web_recommend(self, image_id):
+        return await self.respond(
+            lambda: {"tags": self.library.recommendations(image_id)}, status=404
+        )
+
+    async def web_clusters(self):
+        def build():
+            clusters = self.library.inbox_clusters()
+            return {
+                "clusters": [[light(i) for i in group] for group in clusters[:30]],
+                "total": len(clusters),
+            }
+
+        return await self.respond(build)
+
+    # ---------- tags ----------
+
+    async def gallery_tags(self):
+        def build():
+            return {
+                "tags": self.library.tag_overview(30),
+                "inbox_tags": list(INBOX_TAGS),
+                "aliases": self.library.aliases(),
+            }
+
+        return await self.respond(build)
+
+    async def web_tag_health(self):
+        return await self.respond(lambda: self.library.tag_health(30))
+
+    # ---------- what groups look for ----------
+
+    async def web_insights(self):
+        days = request.query.get("days", 30, type=int) or 30
+        days = min(max(days, 1), 180)
+
+        def build():
+            data = self.library.insights(days)
+            data["top_sent"] = [
+                dict(light(i), sends=i["sends"], swaps=i["swaps"], likes=i["likes"])
+                for i in self.library.top_sent(days, 24)
+            ]
+            return data
+
+        return await self.respond(build)
+
+    def known_scopes(self):
+        found = {}
+        for item in self.library.search() + self.library.search(deleted=True):
+            for origin in [item["origin"], *item["scopes"]]:
+                if ":group:" in origin:
+                    found[origin] = origin_label(origin)
+        with self.library.insights_db() as connection:
+            for (scope,) in connection.execute("SELECT DISTINCT scope FROM search_log"):
+                if ":group:" in scope:
+                    found[scope] = origin_label(scope)
+        return found
+
+    async def web_scopes(self):
+        def build():
+            return {
+                "mode": self.config.get("library_scope", "shared"),
+                "scopes": [
+                    {"scope": scope, "label": label}
+                    for scope, label in sorted(
+                        self.known_scopes().items(), key=lambda e: e[1]
+                    )
+                ],
+            }
+
+        return await self.respond(build)
+
+    async def web_preview(self):
+        """Show what a group would get for a query, using the chat's own rules."""
+        query = str(request.query.get("q", "")).strip()
+        scope = str(request.query.get("scope", ""))
+        mode = str(request.query.get("mode", "search"))
+
+        def build():
+            if not query:
+                raise ValueError("请输入要预览的内容")
+            if len(query) > 200:
+                raise ValueError("搜索条件请控制在 200 字以内")
+            visible = self.visible_scope(scope) if scope else None
+            case = bool(self.config.get("case_sensitive", False))
+            if mode == "quick":
+                # Quick replies need an exact tag (or alias), also inside "来张猫".
+                command_word, args = self.split(query)
+                _, natural, _ = self.natural_words(query)
+                words = [command_word] if command_word and not args else []
+                words += [w for w in natural if w not in words]
+                items = []
+                for word in words:
+                    tag = self.trigger_target(word)
+                    items = [
+                        i
+                        for i in self.library.search(tag, False, case, "new", visible)
+                        if self.fold(tag) in [self.fold(t) for t in i["tags"]]
+                    ]
+                    if items:
+                        break
+                command = query
+            else:
+                boost = None
+                if scope:
+                    boost = {
+                        k: v["sends"] + 2 * v["likes"] - v["swaps"]
+                        for k, v in self.library.send_stats(scope).items()
+                    }
+                items = self.library.search(
+                    query,
+                    False,
+                    case,
+                    "best",
+                    visible,
+                    bool(self.config.get("partial_match", True)),
+                    False,
+                    boost,
                 )
+                command = "搜图 " + query
+            recent = (
+                self.library.sent_recently(
+                    scope, self.number("repeat_hours", 6, 0, 168)
+                )
+                if scope
+                else {}
+            )
+            cards = [dict(light(i), recent=i["digest"] in recent) for i in items[:60]]
+            return {
+                "items": cards,
+                "total": len(items),
+                "command": command,
+                "mode": mode,
+                "scope_mode": self.config.get("library_scope", "shared"),
+                "recent": sum(c["recent"] for c in cards),
+            }
 
-            return json_response(await asyncio.to_thread(build))
-        except (OSError, ValueError) as exc:
-            message = str(exc) if isinstance(exc, ValueError) else "原图读取失败"
-            return error_response(message, status_code=404)
-
-    async def gallery_stats(self):
-        try:
-            self.check_login()
-
-            def build():
-                stats = self.library.stats()
-                stats["top_sent"] = [self.card(item) for item in stats["top_sent"]]
-                return stats
-
-            return json_response(await asyncio.to_thread(build))
-        except ValueError as exc:
-            return error_response(str(exc), status_code=400)
+        return await self.respond(build)
 
     async def gallery_similar(self):
-        try:
-            self.check_login()
+        def build():
+            remaining = self.library.fill_phashes(60)
+            groups = self.library.similar_groups()
+            return {
+                "pending": remaining,
+                "total_groups": len(groups),
+                "groups": [[self.card(item) for item in g] for g in groups[:40]],
+            }
 
-            def build():
-                # Older images are hashed in bounded batches; the page polls until done.
-                # No mutation lock: only hash columns change, so chat collection keeps going.
-                remaining = self.library.fill_phashes(60)
-                groups = self.library.similar_groups()
-                return {
-                    "pending": remaining,
-                    "total_groups": len(groups),
-                    "groups": [[self.card(item) for item in g] for g in groups[:40]],
-                }
+        return await self.respond(build)
 
-            return json_response(await asyncio.to_thread(build))
-        except ValueError as exc:
-            return error_response(str(exc), status_code=400)
+    async def web_operations(self):
+        return await self.respond(lambda: {"operations": self.library.operations(30)})
+
+    # ---------- changes ----------
+
+    def logged(self, action, summary, ids, change):
+        """Apply a change and record before/after states so it can be undone."""
+        before = self.library.snapshot(ids)
+        result = change()
+        after = self.library.snapshot(ids)
+        operation = self.library.log_operation(
+            "web:" + str(request.username), action, summary, before, after
+        )
+        return result, operation
 
     async def gallery_action(self):
         try:
@@ -193,7 +406,7 @@ class GalleryAPI:
             action = body.get("action")
             selection = body.get("select")
             if isinstance(selection, dict):
-                # "Select every search result" is resolved here, across all pages.
+                # "Select every result" is resolved here, across all pages.
                 items = await asyncio.to_thread(
                     self.select,
                     str(selection.get("q", "")),
@@ -215,47 +428,150 @@ class GalleryAPI:
                 item = await asyncio.to_thread(self.library.get, ids[0])
                 return json_response(await self.describe_image(item))
             async with self.mutation:
-                if action in {"add", "remove", "replace"}:
-                    if not ids:
-                        raise ValueError("请先选择图片")
-                    labels = tags_from(body.get("tags", ""))
-                    if action != "replace" and not labels:
-                        raise ValueError("请先输入标签")
-                    await asyncio.to_thread(
-                        self.library.update_tags, ids, action, labels
-                    )
-                elif action in {"delete", "restore"}:
-                    if not ids:
-                        raise ValueError("请先选择图片")
-                    await asyncio.to_thread(
-                        self.library.recycle, ids, action == "restore"
-                    )
-                elif action == "rename":
-                    old, new = body.get("old", ""), body.get("new", "")
-                    if not isinstance(old, str) or not old or not isinstance(new, str):
-                        raise ValueError("请填写原标签和新标签")
-                    count = await asyncio.to_thread(self.library.rename_tag, old, new)
-                    return json_response({"message": f"已更新 {count} 张图片"})
-                elif action == "merge":
-                    keep = body.get("keep")
-                    if type(keep) is not int or keep not in ids:
-                        raise ValueError("请选择要保留的图片")
-                    count = await asyncio.to_thread(self.library.merge, keep, ids)
-                    return json_response(
-                        {
-                            "message": f"已合并 {count} 张相似图片到 #{keep}，其余移入回收站"
-                        }
-                    )
-                elif action == "dismiss":
-                    await asyncio.to_thread(self.library.dismiss_similar, ids)
-                    return json_response({"message": "已标记为不相似，不再提示"})
-                else:
-                    raise ValueError("未知操作")
-            return json_response(
-                {"message": f"已更新 {len(ids)} 张图片", "count": len(ids)}
-            )
+                result = await asyncio.to_thread(self.apply_action, action, ids, body)
+            return json_response(result)
         except (ValueError, TypeError) as exc:
             return error_response(str(exc), status_code=400)
+
+    def apply_action(self, action, ids, body):
+        library = self.library
+        if action in {"add", "remove", "replace"}:
+            if not ids:
+                raise ValueError("请先选择图片")
+            labels = tags_from(body.get("tags", ""))
+            if action != "replace" and not labels:
+                raise ValueError("请先输入标签")
+            summary = {
+                "add": f"为 {len(ids)} 张图片添加{quoted(labels)}",
+                "remove": f"从 {len(ids)} 张图片移除{quoted(labels)}",
+                "replace": f"修改了 {len(ids)} 张图片的标签"
+                if len(ids) > 1
+                else f"修改了图片 #{ids[0]} 的标签",
+            }[action]
+            _, operation = self.logged(
+                "tags", summary, ids, lambda: library.update_tags(ids, action, labels)
+            )
+            return {
+                "message": f"已更新 {len(ids)} 张图片",
+                "count": len(ids),
+                "undo": operation,
+            }
+        if action == "finish":
+            if not ids:
+                raise ValueError("请先选择图片")
+            labels = [t for t in tags_from(body.get("tags", "")) if t not in INBOX_TAGS]
+            if not labels:
+                raise ValueError("请先输入标签")
+            count, operation = self.logged(
+                "finish",
+                f"整理了 {len(ids)} 张图片，标签{quoted(labels)}",
+                ids,
+                lambda: library.finish(ids, labels),
+            )
+            return {
+                "message": f"已为这 {count} 张图打上标签",
+                "count": count,
+                "undo": operation,
+            }
+        if action in {"delete", "restore"}:
+            if not ids:
+                raise ValueError("请先选择图片")
+            restore = action == "restore"
+            summary = f"{'恢复' if restore else '把'} {len(ids)} 张图片{'' if restore else '移入回收站'}"
+            _, operation = self.logged(
+                action, summary, ids, lambda: library.recycle(ids, restore)
+            )
+            return {
+                "message": f"已{'恢复' if restore else '移入回收站'} {len(ids)} 张图片",
+                "count": len(ids),
+                "undo": operation,
+            }
+        if action == "rename":
+            old, new = body.get("old", ""), body.get("new", "")
+            if (
+                not isinstance(old, str)
+                or not old
+                or not isinstance(new, str)
+                or not new
+            ):
+                raise ValueError("请填写原标签和新标签")
+            affected = library.tagged_ids([old])
+            count, operation = self.logged(
+                "rename",
+                f"把「{old}」改为「{new}」",
+                affected,
+                lambda: library.rename_tag(old, new),
+            )
+            return {
+                "message": f"已把 {count} 张图片的「{old}」改为「{new}」",
+                "count": count,
+                "undo": operation,
+            }
+        if action == "merge_tags":
+            sources = [str(t) for t in body.get("sources", []) if str(t).strip()]
+            target = str(body.get("target", "")).strip()
+            if not sources or not target:
+                raise ValueError("请选择要合并的标签和目标标签")
+            affected = library.tagged_ids(sources)
+            count, operation = self.logged(
+                "merge_tags",
+                f"把{quoted(sources)}合并到「{target}」",
+                affected,
+                lambda: library.merge_tags(sources, target),
+            )
+            return {
+                "message": f"已合并，{count} 张图片的标签有变化",
+                "count": count,
+                "undo": operation,
+            }
+        if action == "merge":
+            keep = body.get("keep")
+            if type(keep) is not int or keep not in ids:
+                raise ValueError("请选择要保留的图片")
+            count, operation = self.logged(
+                "merge",
+                f"合并 {len(ids)} 张相似图片到 #{keep}",
+                ids,
+                lambda: library.merge(keep, ids),
+            )
+            return {
+                "message": f"已合并 {count} 张相似图片到 #{keep}，其余移入回收站",
+                "count": count,
+                "undo": operation,
+            }
+        if action in {"approve", "reject"}:
+            if not ids:
+                raise ValueError("请先选择图片")
+            approve = action == "approve"
+            count, operation = self.logged(
+                "review",
+                f"{'通过' if approve else '拒绝'}了 {len(ids)} 张投稿",
+                ids,
+                lambda: library.set_review(ids, approve),
+            )
+            return {
+                "message": f"已通过 {count} 张投稿，群里现在能搜到了"
+                if approve
+                else f"已拒绝 {count} 张投稿，图片移入回收站",
+                "count": count,
+                "undo": operation,
+            }
+        if action == "dismiss":
+            library.dismiss_similar(ids)
+            return {"message": "已标记为不相似，不再提示"}
+        if action == "alias_set":
+            alias, tag = library.set_alias(body.get("alias", ""), body.get("tag", ""))
+            return {"message": f"已设置：发「{alias}」等于找「{tag}」"}
+        if action == "alias_remove":
+            library.remove_alias(body.get("alias", ""))
+            return {"message": "已删除别名"}
+        if action == "undo":
+            result = library.undo(body.get("operation"))
+            message = f"已撤销：{result['summary']}"
+            if result["conflicts"]:
+                message += f"（{result['conflicts']} 张之后又被改过，已保留现状）"
+            return {"message": message, **result}
+        raise ValueError("未知操作")
 
     async def gallery_upload(self):
         temporary = None

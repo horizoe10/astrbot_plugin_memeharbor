@@ -9,9 +9,10 @@ from urllib.parse import urlparse
 from urllib.request import url2pathname
 
 import aiohttp
+from astrbot.api.message_components import Reply
 
 from .library import inspect_image
-from .records import event_sources, expand_records, onebot_action
+from .records import ImageSources, event_sources, expand_records, onebot_action
 
 
 class MediaLoader:
@@ -76,6 +77,32 @@ class MediaLoader:
     @staticmethod
     def image_segments(event):
         return event_sources(event).images
+
+    @staticmethod
+    def direct_segments(event):
+        """Images sent in this message itself, ignoring quoted messages."""
+        chain = [s for s in (event.get_messages() or []) if not isinstance(s, Reply)]
+        return ImageSources().scan(chain).images
+
+    @staticmethod
+    def has_direct_image(event):
+        return bool(MediaLoader.direct_segments(event) or MediaLoader.raw_urls(event))
+
+    async def load_direct(self, event, limit=1):
+        """Read up to limit images from this message; failures are skipped quietly."""
+        result = []
+        for segment in self.direct_segments(event)[:limit]:
+            try:
+                result.append(await self.read_segment(event, segment))
+            except Exception:
+                continue
+        if not result:
+            for url in self.raw_urls(event)[:limit]:
+                try:
+                    result.append(await self.read(url))
+                except (TimeoutError, OSError, ValueError, aiohttp.ClientError):
+                    continue
+        return result
 
     @staticmethod
     def has_media(event):
