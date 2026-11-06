@@ -29,7 +29,7 @@ from .media import MediaLoader
 from .web_api import GalleryAPI
 
 PLUGIN = "astrbot_plugin_memeharbor"
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 COMMANDS = {
     "收集",
     "导入记录",
@@ -499,10 +499,14 @@ class MemeHarborPlugin(Star, GalleryAPI):
         return count, words, explicit
 
     async def quick_tag(self, event, text, woken):
+        # Quick replies are short; a long chat message is never a tag lookup.
+        if len(text) > 60:
+            return False
         command, args = self.split(text)
         words = [command] if command and not args else []
         count, natural, explicit = self.natural_words(text)
         words += [w for w in natural if w not in words]
+        words = [w for w in words if len(w) <= 32]
         for word in words:
             tag = self.trigger_target(word)
             items = await self.tagged(tag, event)

@@ -524,6 +524,24 @@ class GalleryAPI:
                 "count": count,
                 "undo": operation,
             }
+        if action == "merge_all":
+            keeps = body.get("keeps") or {}
+            if not isinstance(keeps, dict):
+                raise ValueError("请求格式无效")
+            groups = library.similar_groups()
+            if not groups:
+                raise ValueError("没有需要合并的相似图片")
+            members = [item["id"] for group in groups for item in group]
+            (done, moved, skipped), operation = self.logged(
+                "merge",
+                f"合并全部 {len(groups)} 组相似图片",
+                members,
+                lambda: library.merge_groups(groups, keeps),
+            )
+            message = f"已合并 {done} 组相似图片，{moved} 张移入回收站"
+            if skipped:
+                message += f"；{skipped} 组合并后标签超过 24 个，已跳过"
+            return {"message": message, "count": moved, "undo": operation}
         if action == "merge":
             keep = body.get("keep")
             if type(keep) is not int or keep not in ids:
