@@ -11,6 +11,7 @@ import sqlite3
 import stat
 import threading
 import time
+import unicodedata
 import uuid
 import zipfile
 from contextlib import contextmanager
@@ -34,7 +35,7 @@ SORTS = ("new", "old", "sent", "inbox")
 # on the same background differ by 22+ bits, so 16 keeps such variants apart.
 HASH_SIDE = 16
 HASH_BITS = HASH_SIDE * HASH_SIDE
-HASH_VERSION = "2"
+HASH_VERSION = "3"
 SIMILAR_DISTANCE = 16
 # Pigeonhole: two first-frame hashes within 16 bits share one of 17 bands.
 BANDS = tuple(
@@ -62,6 +63,18 @@ def tags_from(value: str | list[str]) -> list[str]:
     if len(result) > 24:
         raise ValueError("一张图片最多支持 24 个标签")
     return result
+
+
+def _edit_distance(a, b):
+    previous = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        current = [i]
+        for j, cb in enumerate(b, 1):
+            current.append(
+                min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (ca != cb))
+            )
+        previous = current
+    return previous[-1]
 
 
 def inspect_image(data: bytes, limit: int) -> str:
@@ -93,9 +106,10 @@ def _dhash(frame) -> int:
     return bits
 
 
-def perceptual_hash(source) -> str:
-    """First-frame and middle-frame dHash as hex, or '' for flat images.
+def analyze(source) -> dict:
+    """Perceptual hash plus size and frame count, read in one pass.
 
+    The hash is first-frame and middle-frame dHash as hex ('' for flat images).
     Animated images compare two frames, so different GIFs that merely start from
     the same still are not treated as copies.
     """
@@ -104,6 +118,7 @@ def perceptual_hash(source) -> str:
     ) as image:
         if image.width * image.height > MAX_PIXELS:
             raise ValueError("图片像素过大")
+        width, height = image.size
         frames = getattr(image, "n_frames", 1)
         image.seek(0)
         first = _dhash(ImageOps.exif_transpose(image))
@@ -114,9 +129,15 @@ def perceptual_hash(source) -> str:
             middle = first
     # Flat images carry no structure and would all look alike.
     if first.bit_count() < 4 or first.bit_count() > HASH_BITS - 4:
-        return ""
-    width = HASH_BITS // 4
-    return f"{first:0{width}x}{middle:0{width}x}"
+        phash = ""
+    else:
+        size = HASH_BITS // 4
+        phash = f"{first:0{size}x}{middle:0{size}x}"
+    return {"phash": phash, "width": width, "height": height, "frames": frames}
+
+
+def perceptual_hash(source) -> str:
+    return analyze(source)["phash"]
 
 
 def hash_parts(value):
@@ -139,6 +160,7 @@ class Library:
         self.cache = root / "preview_cache"
         self.thumbs = root / "thumb_cache"
         self.db = root / "library_v2.sqlite3"
+        self.insights_path = root / "insights.sqlite3"
         self.max_bytes = max_bytes
         self._lock = threading.Lock()
         self._cache = None
@@ -166,6 +188,20 @@ class Library:
                     b INTEGER NOT NULL,
                     PRIMARY KEY (a, b)
                 );
+                CREATE TABLE IF NOT EXISTS aliases (
+                    alias TEXT PRIMARY KEY,
+                    tag TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS operations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    at REAL NOT NULL,
+                    actor TEXT NOT NULL DEFAULT '',
+                    action TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    before TEXT NOT NULL,
+                    after TEXT NOT NULL,
+                    undone INTEGER NOT NULL DEFAULT 0
+                );
             """)
             columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(images)")
@@ -183,6 +219,11 @@ class Library:
                 connection.execute(
                     "ALTER TABLE images ADD COLUMN scopes TEXT NOT NULL DEFAULT '[]'"
                 )
+            for column in ("width", "height", "frames"):
+                if column not in columns:
+                    connection.execute(
+                        f"ALTER TABLE images ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
+                    )
             version = connection.execute(
                 "SELECT value FROM meta WHERE key='phash_version'"
             ).fetchone()
@@ -193,6 +234,18 @@ class Library:
                     "INSERT OR REPLACE INTO meta(key, value) VALUES('phash_version', ?)",
                     (HASH_VERSION,),
                 )
+        with self.insights_db() as connection:
+            connection.executescript("""
+                CREATE TABLE IF NOT EXISTS search_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    at REAL NOT NULL,
+                    scope TEXT NOT NULL DEFAULT '',
+                    query TEXT NOT NULL,
+                    results INTEGER NOT NULL,
+                    kind TEXT NOT NULL DEFAULT 'search'
+                );
+                CREATE INDEX IF NOT EXISTS search_at ON search_log(at);
+            """)
 
     @contextmanager
     def connect(self):
@@ -225,6 +278,10 @@ class Library:
             rows = connection.execute(
                 "SELECT * FROM images ORDER BY id DESC"
             ).fetchall()
+            aliases = {
+                row[0]: row[1]
+                for row in connection.execute("SELECT alias, tag FROM aliases")
+            }
         entries = []
         for row in rows:
             item = self.record(row)
@@ -236,7 +293,7 @@ class Library:
                 )
             )
         with self._lock:
-            self._cache = (signature, entries)
+            self._cache = (signature, entries, aliases)
         return entries
 
     @staticmethod
@@ -247,6 +304,8 @@ class Library:
         item["tags"] = json.loads(item["tags"])
         item["scopes"] = json.loads(item.get("scopes") or "[]")
         item.pop("phash_checked", None)
+        for key in ("width", "height", "frames"):
+            item.setdefault(key, 0)
         return item
 
     @staticmethod
@@ -278,18 +337,18 @@ class Library:
         labels = tags_from(tags)
         digest = hashlib.sha256(data).hexdigest()
         try:
-            phash = perceptual_hash(data)
+            facts = analyze(data)
         except (OSError, ValueError):
-            phash = ""
+            facts = {"phash": "", "width": 0, "height": 0, "frames": 0}
         try:
             return self._add(
-                data, extension, labels, digest, phash, owner, origin, restore_duplicate
+                data, extension, labels, digest, facts, owner, origin, restore_duplicate
             )
         finally:
             self.invalidate()
 
     def _add(
-        self, data, extension, labels, digest, phash, owner, origin, restore_duplicate
+        self, data, extension, labels, digest, facts, owner, origin, restore_duplicate
     ):
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -329,7 +388,7 @@ class Library:
                 finally:
                     temporary.unlink(missing_ok=True)
                 cursor = connection.execute(
-                    "INSERT INTO images(filename,digest,tags,created,owner,origin,phash,phash_checked) VALUES(?,?,?,?,?,?,?,1)",
+                    "INSERT INTO images(filename,digest,tags,created,owner,origin,phash,phash_checked,width,height,frames) VALUES(?,?,?,?,?,?,?,1,?,?,?)",
                     (
                         filename,
                         digest,
@@ -337,7 +396,10 @@ class Library:
                         time.time(),
                         owner,
                         origin,
-                        phash,
+                        facts["phash"],
+                        facts["width"],
+                        facts["height"],
+                        facts["frames"],
                     ),
                 )
                 image_id = cursor.lastrowid
@@ -349,20 +411,29 @@ class Library:
         groups = [
             re.split(r"[\s,，、;；]+", group.strip()) for group in query.split("|")
         ]
+        entries = self._entries()
+        aliases = self.aliases()
 
         def matches(entry, term):
             item, folded_tags, folded_text = entry
             if term.startswith("#"):
                 return str(item["id"]) == term[1:]
+            target = aliases.get(term.casefold())
             if case_sensitive:
-                return term in item["tags"] or term in (
-                    item["caption"] + " " + item["ocr"]
+                return (
+                    term in item["tags"]
+                    or term in (item["caption"] + " " + item["ocr"])
+                    or (target is not None and target in item["tags"])
                 )
             term = term.casefold()
-            return term in folded_tags or term in folded_text
+            return (
+                term in folded_tags
+                or term in folded_text
+                or (target is not None and target.casefold() in folded_tags)
+            )
 
         result = []
-        for entry in self._entries():
+        for entry in entries:
             item = entry[0]
             if bool(item["deleted"]) != deleted:
                 continue
@@ -522,14 +593,21 @@ class Library:
             )
 
     def mark_sent(self, image_id):
-        try:
-            return self._mark_sent(image_id)
-        finally:
-            self.invalidate()
-
-    def _mark_sent(self, image_id):
+        # Sending is frequent: update the cached entry in place instead of
+        # re-parsing the whole catalog after every image a group receives.
+        with self._lock:
+            fresh = self._cache is not None and self._cache[0] == self._signature()
         with self.connect() as connection:
             connection.execute("UPDATE images SET sent=sent+1 WHERE id=?", (image_id,))
+        with self._lock:
+            if fresh and self._cache is not None:
+                for item, _, _ in self._cache[1]:
+                    if item["id"] == int(image_id):
+                        item["sent"] += 1
+                        break
+                self._cache = (self._signature(), *self._cache[1:])
+            else:
+                self._cache = None
 
     def thumbnail_data(self, item, size=320):
         """Return a cached WebP thumbnail keyed by content digest."""
@@ -587,14 +665,23 @@ class Library:
         updates = []
         for row in rows:
             try:
-                value = perceptual_hash(self.path({"filename": row["filename"]}))
+                facts = analyze(self.path({"filename": row["filename"]}))
             except (OSError, ValueError):
-                value = ""
-            updates.append((value, row["id"]))
+                facts = {"phash": "", "width": 0, "height": 0, "frames": 0}
+            updates.append(
+                (
+                    facts["phash"],
+                    facts["width"],
+                    facts["height"],
+                    facts["frames"],
+                    row["id"],
+                )
+            )
         if updates:
             with self.connect() as connection:
                 connection.executemany(
-                    "UPDATE images SET phash=?, phash_checked=1 WHERE id=?", updates
+                    "UPDATE images SET phash=?, width=?, height=?, frames=?, phash_checked=1 WHERE id=?",
+                    updates,
                 )
             self.invalidate()
         with self.connect() as connection:
@@ -723,6 +810,540 @@ class Library:
                 [(time.time(), source["id"]) for source in sources],
             )
         return len(sources)
+
+    # ---------- tag aliases ----------
+
+    def aliases(self):
+        self._entries()
+        with self._lock:
+            return dict(self._cache[2]) if self._cache else {}
+
+    def alias_target(self, word):
+        return self.aliases().get(word.casefold())
+
+    def set_alias(self, alias, tag):
+        alias_words, tag_words = tags_from(alias), tags_from(tag)
+        if len(alias_words) != 1 or len(tag_words) != 1:
+            raise ValueError("别名和目标标签都只能是一个词")
+        alias, tag = alias_words[0], tag_words[0]
+        if alias.casefold() == tag.casefold():
+            raise ValueError("别名不能和目标标签相同")
+        existing = self.aliases()
+        if tag.casefold() in existing:
+            raise ValueError(
+                f"「{tag}」本身是别名，请直接指向「{existing[tag.casefold()]}」"
+            )
+        counts = {t.casefold(): n for t, n in self.tag_counts().items()}
+        if alias.casefold() in counts:
+            raise ValueError(f"「{alias}」本身已经是标签，请改用合并标签")
+        if tag.casefold() not in counts:
+            raise ValueError(f"图库里还没有「{tag}」这个标签")
+        with self.connect() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO aliases(alias, tag) VALUES(?, ?)",
+                (alias.casefold(), tag),
+            )
+        self.invalidate()
+        return alias, tag
+
+    def remove_alias(self, alias):
+        with self.connect() as connection:
+            removed = connection.execute(
+                "DELETE FROM aliases WHERE alias=?", (str(alias).casefold(),)
+            ).rowcount
+        self.invalidate()
+        if not removed:
+            raise ValueError("没有找到这个别名")
+
+    # ---------- chat search log (separate file, so it never invalidates the index) ----------
+
+    @contextmanager
+    def insights_db(self):
+        connection = sqlite3.connect(self.insights_path, timeout=10)
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
+    def record_search(self, scope, query, results, kind="search"):
+        query = re.sub(r"\s+", " ", str(query)).strip()[:200]
+        if not query:
+            return
+        with self.insights_db() as connection:
+            connection.execute(
+                "INSERT INTO search_log(at, scope, query, results, kind) VALUES(?,?,?,?,?)",
+                (time.time(), scope, query, int(results), kind),
+            )
+            connection.execute(
+                "DELETE FROM search_log WHERE id <= (SELECT MAX(id) FROM search_log) - 20000"
+            )
+
+    @staticmethod
+    def query_terms(query):
+        return [
+            term.lstrip("-")
+            for term in re.split(r"[\s,，、;；|]+", query)
+            if term.lstrip("-") and not term.startswith("#")
+        ]
+
+    def searched_terms(self, days=30):
+        since = time.time() - days * 86400
+        counts = {}
+        with self.insights_db() as connection:
+            for (query,) in connection.execute(
+                "SELECT query FROM search_log WHERE at >= ?", (since,)
+            ):
+                for term in self.query_terms(query):
+                    key = term.casefold()
+                    counts[key] = counts.get(key, 0) + 1
+        return counts
+
+    def insights(self, days=30):
+        since = time.time() - days * 86400
+        with self.insights_db() as connection:
+            rows = connection.execute(
+                "SELECT at, scope, query, results, kind FROM search_log WHERE at >= ? ORDER BY at",
+                (since,),
+            ).fetchall()
+        top, misses, daily = {}, {}, {}
+        for at, scope, query, results, _kind in rows:
+            entry = top.setdefault(query, {"query": query, "count": 0, "last": 0})
+            entry["count"] += 1
+            entry["last"] = at
+            day = time.strftime("%m-%d", time.localtime(at))
+            daily[day] = daily.get(day, 0) + 1
+            if results == 0:
+                miss = misses.setdefault(
+                    query, {"query": query, "count": 0, "last": 0, "chats": set()}
+                )
+                miss["count"] += 1
+                miss["last"] = at
+                miss["chats"].add(scope)
+        missed = []
+        for miss in sorted(misses.values(), key=lambda m: (-m["count"], -m["last"])):
+            # A query that finds images now has been filled since it missed.
+            now = len(self.search(miss["query"]))
+            missed.append(
+                {
+                    "query": miss["query"],
+                    "count": miss["count"],
+                    "last": miss["last"],
+                    "chats": len(miss["chats"]),
+                    "now": now,
+                }
+            )
+        return {
+            "days": days,
+            "searches": len(rows),
+            "top": sorted(top.values(), key=lambda t: (-t["count"], -t["last"]))[:20],
+            "misses": missed[:30],
+            "daily": [{"day": d, "count": n} for d, n in daily.items()][-14:],
+        }
+
+    # ---------- tag management ----------
+
+    def tag_overview(self, days=30):
+        searched = self.searched_terms(days)
+        aliases = {}
+        for alias, tag in self.aliases().items():
+            aliases.setdefault(tag, []).append(alias)
+        tags = {}
+        for item, _, _ in self._entries():
+            if item["deleted"]:
+                continue
+            for tag in item["tags"]:
+                info = tags.setdefault(
+                    tag, {"tag": tag, "count": 0, "sent": 0, "latest": 0, "cover": None}
+                )
+                info["count"] += 1
+                info["sent"] += item["sent"]
+                info["latest"] = max(info["latest"], item["created"])
+                best = info["cover"]
+                if best is None or (item["sent"], item["id"]) > (
+                    best["sent"],
+                    best["id"],
+                ):
+                    info["cover"] = {"id": item["id"], "sent": item["sent"]}
+        result = []
+        for info in tags.values():
+            info["cover"] = info["cover"]["id"]
+            info["aliases"] = sorted(aliases.get(info["tag"], []))
+            info["searches"] = searched.get(info["tag"].casefold(), 0) + sum(
+                searched.get(a, 0) for a in info["aliases"]
+            )
+            info["inbox"] = info["tag"] in INBOX_TAGS
+            result.append(info)
+        return sorted(result, key=lambda t: (-t["count"], t["tag"]))
+
+    @staticmethod
+    def _tag_key(tag):
+        text = unicodedata.normalize("NFKC", tag).casefold()
+        text = re.sub(r"[\s~～!！?？.。…,，、·'\"]+", "", text)
+        return re.sub(r"(.)\1+", r"\1", text)
+
+    @staticmethod
+    def _group_cooccurring(pairs, overview):
+        """Fold tags that always appear together into one suggestion per group.
+
+        Four tags used on the same images would otherwise produce six
+        pairwise suggestions with conflicting targets. Each group keeps its
+        biggest tag and points every other member at it.
+        """
+        together = [p for p in pairs if p["reason"] == "几乎总是一起出现"]
+        if not together:
+            return pairs
+        parent = {}
+
+        def find(tag):
+            parent.setdefault(tag, tag)
+            while parent[tag] != tag:
+                parent[tag] = parent[parent[tag]]
+                tag = parent[tag]
+            return tag
+
+        for pair in together:
+            parent[find(pair["other"])] = find(pair["keep"])
+        info = {t["tag"]: (i, t) for i, t in enumerate(overview)}
+        groups = {}
+        for tag in parent:
+            groups.setdefault(find(tag), []).append(tag)
+        grouped = []
+        for members in groups.values():
+            members.sort(
+                key=lambda t: (-info[t][1]["count"], -info[t][1]["sent"], info[t][0])
+            )
+            keep = info[members[0]][1]
+            for name in members[1:]:
+                other = info[name][1]
+                grouped.append(
+                    {
+                        "keep": keep["tag"],
+                        "other": other["tag"],
+                        "reason": "几乎总是一起出现",
+                        "keep_count": keep["count"],
+                        "other_count": other["count"],
+                    }
+                )
+        result, seen = [], set()
+        for pair in [p for p in pairs if p["reason"] != "几乎总是一起出现"] + grouped:
+            key = frozenset((pair["keep"], pair["other"]))
+            if key not in seen:
+                seen.add(key)
+                result.append(pair)
+        return result
+
+    def tag_health(self, days=30):
+        overview = [t for t in self.tag_overview(days) if not t["inbox"]]
+        members = {}
+        for item, _, _ in self._entries():
+            if not item["deleted"]:
+                for tag in item["tags"]:
+                    members.setdefault(tag, set()).add(item["id"])
+        pairs, seen = [], set()
+
+        def add(a, b, reason):
+            key = tuple(sorted((a["tag"], b["tag"])))
+            if key in seen:
+                return
+            seen.add(key)
+            keep, other = (
+                (a, b) if (a["count"], a["sent"]) >= (b["count"], b["sent"]) else (b, a)
+            )
+            pairs.append(
+                {
+                    "keep": keep["tag"],
+                    "other": other["tag"],
+                    "reason": reason,
+                    "keep_count": keep["count"],
+                    "other_count": other["count"],
+                }
+            )
+
+        by_key = {}
+        for tag in overview:
+            by_key.setdefault(self._tag_key(tag["tag"]), []).append(tag)
+        for group in by_key.values():
+            for i, a in enumerate(group):
+                for b in group[i + 1 :]:
+                    add(a, b, "写法不同")
+        for i, a in enumerate(overview[:600]):
+            for b in overview[i + 1 : 600]:
+                sa, sb = members[a["tag"]], members[b["tag"]]
+                if min(len(sa), len(sb)) >= 3 and len(sa & sb) / len(sa | sb) >= 0.8:
+                    add(a, b, "几乎总是一起出现")
+                elif (
+                    min(len(a["tag"]), len(b["tag"])) >= 3
+                    and abs(len(a["tag"]) - len(b["tag"])) <= 1
+                    and _edit_distance(a["tag"].casefold(), b["tag"].casefold()) == 1
+                ):
+                    add(a, b, "只差一个字")
+        pairs = self._group_cooccurring(pairs, overview)
+        has_history = bool(self.searched_terms(days))
+        return {
+            "duplicates": pairs[:50],
+            "singletons": [t["tag"] for t in overview if t["count"] == 1][:100],
+            "unsearched": [t["tag"] for t in overview if not t["searches"]][:100]
+            if has_history
+            else [],
+            "has_history": has_history,
+        }
+
+    def finish(self, ids, labels):
+        try:
+            return self._finish(ids, labels)
+        finally:
+            self.invalidate()
+
+    def _finish(self, ids, labels):
+        """Add tags and take images out of the inbox in one undoable step."""
+        labels = [t for t in tags_from(labels) if t not in INBOX_TAGS]
+        if not labels:
+            raise ValueError("请先输入标签")
+        changed = 0
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for image_id in ids:
+                row = connection.execute(
+                    "SELECT * FROM images WHERE id=? AND deleted IS NULL",
+                    (int(image_id),),
+                ).fetchone()
+                if row is None:
+                    # Trashed or merged since the page loaded; tag the rest.
+                    continue
+                item = self.record(row)
+                tags = list(
+                    dict.fromkeys(
+                        [t for t in item["tags"] if t not in INBOX_TAGS] + labels
+                    )
+                )
+                if len(tags) > 24:
+                    raise ValueError("一张图片最多支持 24 个标签")
+                connection.execute(
+                    "UPDATE images SET tags=? WHERE id=?",
+                    (json.dumps(tags, ensure_ascii=False), int(image_id)),
+                )
+                changed += 1
+        if not changed:
+            raise ValueError("这些图片已经不在图库里了，请刷新页面")
+        return changed
+
+    def merge_tags(self, sources, target):
+        """Fold several tags into one across all active images."""
+        changed = 0
+        for source in dict.fromkeys(sources):
+            if source != target:
+                changed += self.rename_tag(source, target)
+        return changed
+
+    # ---------- triage helpers ----------
+
+    def recommendations(self, image_id, limit=9):
+        item = self.get(image_id, True)
+        own = set(item["tags"]) | set(INBOX_TAGS)
+        scores, reasons = {}, {}
+
+        def vote(tag, weight, reason):
+            if tag in own:
+                return
+            scores[tag] = scores.get(tag, 0) + weight
+            reasons.setdefault(tag, reason)
+
+        entries = [e[0] for e in self._entries() if not e[0]["deleted"]]
+        if len(item["phash"]) == HASH_BITS // 2:
+            mine = hash_parts(item["phash"])
+            near = sorted(
+                (hash_distance(mine, hash_parts(o["phash"])), o["id"], o)
+                for o in entries
+                if o["id"] != item["id"] and len(o["phash"]) == HASH_BITS // 2
+            )
+            for distance, _, other in near[:8]:
+                if distance <= 70:
+                    for tag in other["tags"]:
+                        vote(tag, 4 - distance / 25, "长得像的图用过")
+        same_owner = [
+            o
+            for o in entries
+            if item["owner"] and o["owner"] == item["owner"] and o["id"] != item["id"]
+        ]
+        for other in sorted(same_owner, key=lambda o: -o["created"])[:20]:
+            for tag in other["tags"]:
+                vote(tag, 1.2, "同一人最近用过")
+        same_chat = [
+            o
+            for o in entries
+            if item["origin"]
+            and o["origin"] == item["origin"]
+            and o["id"] != item["id"]
+        ]
+        for other in sorted(same_chat, key=lambda o: -o["created"])[:30]:
+            for tag in other["tags"]:
+                vote(tag, 0.8, "这个群最近常用")
+        for rank, tag in enumerate(list(self.tag_counts())[:12]):
+            vote(tag, 0.6 - rank * 0.03, "常用标签")
+        ordered = sorted(scores, key=lambda t: -scores[t])[:limit]
+        return [{"tag": tag, "reason": reasons[tag]} for tag in ordered]
+
+    def inbox_clusters(self, distance=45, limit=1000):
+        """Group inbox images that look like one series, for tagging together."""
+        items = [
+            e[0]
+            for e in self._entries()
+            if not e[0]["deleted"]
+            and in_inbox(e[0])
+            and len(e[0]["phash"]) == HASH_BITS // 2
+        ][:limit]
+        values = {i["id"]: hash_parts(i["phash"]) for i in items}
+        assigned, clusters = set(), []
+        for anchor in items:
+            if anchor["id"] in assigned:
+                continue
+            group = [anchor] + [
+                other
+                for other in items
+                if other["id"] != anchor["id"]
+                and other["id"] not in assigned
+                and hash_distance(values[anchor["id"]], values[other["id"]]) <= distance
+            ]
+            if len(group) > 1:
+                assigned.update(i["id"] for i in group)
+                clusters.append([self.copy(i) for i in group])
+        clusters.sort(key=lambda g: -len(g))
+        return clusters
+
+    def recent_collections(self, days=7):
+        since = time.time() - days * 86400
+        counts = {}
+        for item, _, _ in self._entries():
+            if item["created"] >= since and not item["deleted"]:
+                counts[item["origin"]] = counts.get(item["origin"], 0) + 1
+        return sorted(counts.items(), key=lambda entry: -entry[1])
+
+    # ---------- undo log for web edits ----------
+
+    def snapshot(self, ids):
+        ids = [int(i) for i in ids]
+        result = {}
+        with self.connect() as connection:
+            for start in range(0, len(ids), 500):
+                chunk = ids[start : start + 500]
+                for row in connection.execute(
+                    f"SELECT id, tags, deleted, caption, ocr, sent FROM images WHERE id IN ({','.join('?' * len(chunk))})",
+                    chunk,
+                ):
+                    result[str(row["id"])] = {
+                        "tags": json.loads(row["tags"]),
+                        "deleted": row["deleted"],
+                        "caption": row["caption"],
+                        "ocr": row["ocr"],
+                        "sent": row["sent"],
+                    }
+        return result
+
+    def tagged_ids(self, tags):
+        wanted = set(tags)
+        return [
+            e[0]["id"]
+            for e in self._entries()
+            if not e[0]["deleted"] and wanted & set(e[0]["tags"])
+        ]
+
+    def log_operation(self, actor, action, summary, before, after):
+        changed = {k: v for k, v in after.items() if before.get(k) != v}
+        if not changed:
+            return None
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "INSERT INTO operations(at, actor, action, summary, before, after) VALUES(?,?,?,?,?,?)",
+                (
+                    time.time(),
+                    actor,
+                    action,
+                    summary,
+                    json.dumps({k: before[k] for k in changed}, ensure_ascii=False),
+                    json.dumps(changed, ensure_ascii=False),
+                ),
+            )
+            connection.execute(
+                "DELETE FROM operations WHERE id <= (SELECT MAX(id) FROM operations) - 200"
+            )
+        self.invalidate()
+        return cursor.lastrowid
+
+    def operations(self, limit=20):
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT id, at, actor, action, summary, undone, after FROM operations ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [
+            {
+                "id": r["id"],
+                "at": r["at"],
+                "actor": r["actor"],
+                "action": r["action"],
+                "summary": r["summary"],
+                "undone": bool(r["undone"]),
+                "count": len(json.loads(r["after"])),
+            }
+            for r in rows
+        ]
+
+    def undo(self, operation_id):
+        """Restore images still exactly as the operation left them; skip later edits."""
+        try:
+            with self.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT * FROM operations WHERE id=?", (int(operation_id),)
+                ).fetchone()
+                if row is None:
+                    raise ValueError("没有找到这次操作")
+                if row["undone"]:
+                    raise ValueError("这次操作已经撤销过了")
+                before, after = json.loads(row["before"]), json.loads(row["after"])
+                restored = conflicts = 0
+                for key, state in after.items():
+                    current = connection.execute(
+                        "SELECT tags, deleted, caption, ocr, sent FROM images WHERE id=?",
+                        (int(key),),
+                    ).fetchone()
+                    if current is None:
+                        conflicts += 1
+                        continue
+                    now = {
+                        "tags": json.loads(current["tags"]),
+                        "deleted": current["deleted"],
+                        "caption": current["caption"],
+                        "ocr": current["ocr"],
+                        "sent": current["sent"],
+                    }
+                    if now != state:
+                        conflicts += 1
+                        continue
+                    old = before[key]
+                    connection.execute(
+                        "UPDATE images SET tags=?, deleted=?, caption=?, ocr=?, sent=? WHERE id=?",
+                        (
+                            json.dumps(old["tags"], ensure_ascii=False),
+                            old["deleted"],
+                            old["caption"],
+                            old["ocr"],
+                            old["sent"],
+                            int(key),
+                        ),
+                    )
+                    restored += 1
+                connection.execute(
+                    "UPDATE operations SET undone=1 WHERE id=?", (row["id"],)
+                )
+            return {
+                "restored": restored,
+                "conflicts": conflicts,
+                "summary": row["summary"],
+            }
+        finally:
+            self.invalidate()
 
     def export(self):
         items = self.search() + self.search(deleted=True)

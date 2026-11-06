@@ -19,7 +19,7 @@ from .media import MediaLoader
 from .web_api import GalleryAPI
 
 PLUGIN = "astrbot_plugin_memeharbor"
-VERSION = "1.3.0"
+VERSION = "2.0.0"
 COMMANDS = {
     "收集",
     "导入记录",
@@ -93,7 +93,7 @@ def reasons(errors, limit=2):
 
 @register(
     PLUGIN,
-    "Ghostberry",
+    "horizoe10",
     "表情港湾 MemeHarbor：跨平台表情包收集与斗图助手，多标签搜图、随机发图与可视化图库管理",
     VERSION,
 )
@@ -167,16 +167,31 @@ class MemeHarborPlugin(Star, GalleryAPI):
                 return False
         return True
 
-    def visible(self, event):
-        """Per-group mode: a chat sees its own images plus web/backup imports."""
-        if event is None or self.config.get("library_scope", "shared") != "group":
+    def visible_scope(self, scope):
+        """Per-group mode: a chat sees its own images plus shared imports.
+
+        Images without a chat origin (web, backups, early imports whose origin
+        is a file name or "batch_record") belong to every group.
+        """
+        if not scope or self.config.get("library_scope", "shared") != "group":
             return None
-        scope = self.scope(event)
         return lambda item: (
-            item["origin"] in ("", "web")
+            ":" not in item["origin"]
             or item["origin"] == scope
             or scope in item["scopes"]
         )
+
+    def visible(self, event):
+        return None if event is None else self.visible_scope(self.scope(event))
+
+    async def log_search(self, event, query, results, kind="search"):
+        # Feeds the web page's "what groups look for" view; never breaks chat.
+        try:
+            await asyncio.to_thread(
+                self.library.record_search, self.scope(event), query, results, kind
+            )
+        except Exception:
+            logger.warning("MemeHarbor could not record a search", exc_info=True)
 
     async def fetch(self, event, image_id, include_deleted=False):
         item = await asyncio.to_thread(self.library.get, image_id, include_deleted)
@@ -310,6 +325,8 @@ class MemeHarborPlugin(Star, GalleryAPI):
                 ):
                     tag = target
                     break
+            else:
+                tag = self.library.alias_target(command) or command
             items = await self.search(tag, event=event)
             # Quick replies require an exact tag, so casual chat never matches OCR.
             normalize = (
@@ -405,6 +422,11 @@ class MemeHarborPlugin(Star, GalleryAPI):
             items = sorted(
                 (i for i in items if i["id"] in ranks), key=lambda i: ranks[i["id"]]
             )
+        if not deleted and page == 1 and query:
+            if query.startswith("AI："):
+                await self.log_search(event, query[3:], len(items), "ai")
+            else:
+                await self.log_search(event, query, len(items))
         if not items:
             self.pages.pop(self.user_key(event), None)
             if deleted:
@@ -552,9 +574,10 @@ class MemeHarborPlugin(Star, GalleryAPI):
             maximum = self.number("max_send_count", 3, 1, 3)
             if count < 1 or count > maximum:
                 raise ValueError(f"一次可以发 1～{maximum} 张")
-            await self.send_images(
-                event, await self.search(" ".join(parts), event=event), count
-            )
+            query = " ".join(parts)
+            items = await self.search(query, event=event)
+            await self.log_search(event, query, len(items), "random")
+            await self.send_images(event, items, count)
         elif command == "图片详情":
             if not args:
                 raise ValueError("用法：图片详情 12")
