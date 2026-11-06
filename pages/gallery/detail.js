@@ -71,6 +71,13 @@ export function Detail() {
     const next = list[index + 1] ?? list[index - 1];
     set({ detail: next ?? null, detailList: list.filter((x) => x !== id) });
   };
+  const judge = async (approve) => {
+    const result = await api.action(approve ? 'approve' : 'reject', { ids: [id] });
+    toast(result.message, 'ok', result.undo);
+    const fresh = await api.detail(id, true);
+    if (live.current.id === id) setData(fresh);
+    changed([id]); refreshShared().catch(() => {});
+  };
   const describe = async () => {
     setBusy(true); setAiText('正在识别，最长约 45 秒…');
     try { const r = await api.action('describe', { ids: [id] }); setAiText(r.caption + (r.ocr ? '\n图中文字：' + r.ocr : '')); setRec(r.tags.map((tag) => ({ tag, reason: 'AI 建议' })).concat(rec)); }
@@ -98,6 +105,7 @@ export function Detail() {
     <header class="drawer-head">
       <strong>${'#' + id}</strong>
       ${data ? html`<span class="pill">${data.origin}</span>` : null}
+      ${data?.auto ? html`<span class="pill">自动收集</span>` : null}
       <span class="grow"></span>
       <button class="icon-button" title="上一张 ←" onClick=${() => move(-1).catch(fail)}><${Icon} name="left" /></button>
       <button class="icon-button" title="下一张 →" onClick=${() => move(1).catch(fail)}><${Icon} name="right" /></button>
@@ -105,6 +113,8 @@ export function Detail() {
     </header>
     <div class="drawer-preview">${error ? html`<span class="muted">${error}</span>` : data ? html`<img src=${data.preview} alt=${'图片 ' + id} />` : html`<span class="skeleton"></span>`}</div>
     ${data ? html`<p class="meta">${data.width} × ${data.height} · ${fmtSize(data.bytes)} · ${data.animated ? '动图' : '静态图'} · 收集于 ${fmtDate(data.created)} · 已发送 ${data.sent} 次</p>` : null}
+    ${data?.review && !deleted ? html`<div class="notice">这是群友的投稿，通过后群里才能搜到。
+      <div class="row"><button class="primary" onClick=${() => judge(true).catch(fail)}>通过</button><button class="danger" onClick=${() => judge(false).catch(fail)}>不通过</button></div></div>` : null}
     ${deleted ? html`<p class="notice">这张图片在回收站里，恢复后才能修改标签。</p>` : html`
       <label class="label">标签</label>
       <${TagInput} value=${tags} inputRef=${input} onChange=${(v) => { setTags(v); setDirty(true); }} onSubmit=${({ next, pending }) => (next ? save(false, pending).then(() => move(1)) : save(false, pending)).catch(fail)} />

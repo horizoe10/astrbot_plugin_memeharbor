@@ -9,7 +9,7 @@ from astrbot.api.web import error_response, file_response, json_response, reques
 from .library import INBOX_TAGS, SORTS, in_inbox, tags_from
 
 PLUGIN = "astrbot_plugin_memeharbor"
-VIEWS = ("all", "inbox", "trash")
+VIEWS = ("all", "inbox", "trash", "review")
 MAX_BATCH = 10000
 
 
@@ -47,6 +47,8 @@ def light(item):
         "deleted": item["deleted"],
         "gif": item["filename"].lower().endswith(".gif"),
         "inbox": in_inbox(item),
+        "review": bool(item.get("review")),
+        "auto": item["owner"] == "auto",
         "origin": origin_label(item["origin"]),
         "width": item.get("width", 0),
         "height": item.get("height", 0),
@@ -120,6 +122,9 @@ class GalleryAPI:
             view == "trash",
             bool(self.config.get("case_sensitive", False)),
             sort,
+            None,
+            bool(self.config.get("partial_match", True)),
+            view == "review",
         )
         return [item for item in items if in_inbox(item)] if view == "inbox" else items
 
@@ -129,6 +134,7 @@ class GalleryAPI:
             "all": stats["total"],
             "inbox": stats["inbox"],
             "trash": stats["deleted"],
+            "review": stats["review"],
         }
 
     # ---------- overview ----------
@@ -165,6 +171,9 @@ class GalleryAPI:
                 "operations": self.library.operations(5),
                 "ai_enabled": bool(self.config.get("ai_enabled", False)),
                 "library_scope": self.config.get("library_scope", "shared"),
+                "review_mode": bool(self.config.get("review_mode", False)),
+                "last_backup": self.library.last_backup(self.backups),
+                "backup_days": self.number("auto_backup_days", 7, 0, 60),
             }
 
         return await self.respond(build)
@@ -256,7 +265,17 @@ class GalleryAPI:
 
     async def web_insights(self):
         days = request.query.get("days", 30, type=int) or 30
-        return await self.respond(lambda: self.library.insights(min(max(days, 1), 180)))
+        days = min(max(days, 1), 180)
+
+        def build():
+            data = self.library.insights(days)
+            data["top_sent"] = [
+                dict(light(i), sends=i["sends"], swaps=i["swaps"], likes=i["likes"])
+                for i in self.library.top_sent(days, 24)
+            ]
+            return data
+
+        return await self.respond(build)
 
     def known_scopes(self):
         found = {}
@@ -298,22 +317,47 @@ class GalleryAPI:
             visible = self.visible_scope(scope) if scope else None
             case = bool(self.config.get("case_sensitive", False))
             if mode == "quick":
-                # Quick replies need an exact tag (or alias) and send one image.
-                tag = self.library.alias_target(query) or query
-                for entry in self.config.get("commands", []) or []:
-                    if isinstance(entry, dict) and entry.get("command") == query:
-                        tag = entry.get("prefix") or tag
-                fold = (lambda x: x) if case else str.casefold
-                items = [
-                    i
-                    for i in self.library.search(tag, False, case, "new", visible)
-                    if fold(tag) in [fold(t) for t in i["tags"]]
-                ]
+                # Quick replies need an exact tag (or alias), also inside "来张猫".
+                command_word, args = self.split(query)
+                _, natural, _ = self.natural_words(query)
+                words = [command_word] if command_word and not args else []
+                words += [w for w in natural if w not in words]
+                items = []
+                for word in words:
+                    tag = self.trigger_target(word)
+                    items = [
+                        i
+                        for i in self.library.search(tag, False, case, "new", visible)
+                        if self.fold(tag) in [self.fold(t) for t in i["tags"]]
+                    ]
+                    if items:
+                        break
                 command = query
             else:
-                items = self.library.search(query, False, case, "new", visible)
+                boost = None
+                if scope:
+                    boost = {
+                        k: v["sends"] + 2 * v["likes"] - v["swaps"]
+                        for k, v in self.library.send_stats(scope).items()
+                    }
+                items = self.library.search(
+                    query,
+                    False,
+                    case,
+                    "best",
+                    visible,
+                    bool(self.config.get("partial_match", True)),
+                    False,
+                    boost,
+                )
                 command = "搜图 " + query
-            recent = set(self.recent.get(scope, [])) if scope else set()
+            recent = (
+                self.library.sent_recently(
+                    scope, self.number("repeat_hours", 6, 0, 168)
+                )
+                if scope
+                else {}
+            )
             cards = [dict(light(i), recent=i["digest"] in recent) for i in items[:60]]
             return {
                 "items": cards,
@@ -492,6 +536,23 @@ class GalleryAPI:
             )
             return {
                 "message": f"已合并 {count} 张相似图片到 #{keep}，其余移入回收站",
+                "count": count,
+                "undo": operation,
+            }
+        if action in {"approve", "reject"}:
+            if not ids:
+                raise ValueError("请先选择图片")
+            approve = action == "approve"
+            count, operation = self.logged(
+                "review",
+                f"{'通过' if approve else '拒绝'}了 {len(ids)} 张投稿",
+                ids,
+                lambda: library.set_review(ids, approve),
+            )
+            return {
+                "message": f"已通过 {count} 张投稿，群里现在能搜到了"
+                if approve
+                else f"已拒绝 {count} 张投稿，图片移入回收站",
                 "count": count,
                 "undo": operation,
             }

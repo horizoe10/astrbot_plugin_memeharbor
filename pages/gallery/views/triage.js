@@ -189,13 +189,15 @@ function Clusters() {
 
 export function Triage() {
   const inbox = useStore((s) => s.counts.inbox);
+  const review = useStore((s) => s.counts.review);
   const route = useStore((s) => s.route);
   const mode = route.params.get('mode') || 'single';
   return html`<div class="page triage">
     <header class="page-head">
       <div><h1>整理新图</h1><p class="muted">还有 ${inbox} 张没有标签的图。打好标签，群里才能搜到它们。</p></div>
       <div class="tabs"><button class=${'tab' + (mode === 'single' ? ' on' : '')} onClick=${() => go('triage')}>逐张整理</button>
-        <button class=${'tab' + (mode === 'clusters' ? ' on' : '')} onClick=${() => go('triage', { mode: 'clusters' })}>按系列整理</button></div>
+        <button class=${'tab' + (mode === 'clusters' ? ' on' : '')} onClick=${() => go('triage', { mode: 'clusters' })}>按系列整理</button>
+        ${review ? html`<button class="tab attention" onClick=${() => go('library', { view: 'review' })}>审核投稿<small>${review}</small></button>` : null}</div>
     </header>
     ${mode === 'clusters' ? html`<${Clusters} />` : html`<${Single} />`}
   </div>`;

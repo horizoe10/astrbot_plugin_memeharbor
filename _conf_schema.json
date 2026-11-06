@@ -3,30 +3,40 @@
     "description": "需要 @机器人 或唤醒前缀",
     "type": "bool",
     "default": true,
-    "hint": "开启时，裸发的命令和快捷斗图都要先 @机器人 或带唤醒前缀；关闭后可直接发「收集 猫」。带 / 的命令不受影响。"
+    "hint": "开启时，裸发的命令和快捷斗图都要先 @机器人 或带唤醒前缀；关闭后可直接发「收集 猫」。带 / 的命令不受影响。只想让斗图免 @，请用下一项。"
   },
-  "case_sensitive": {
-    "description": "搜图和快捷斗图区分大小写",
+  "free_trigger": {
+    "description": "斗图免 @",
     "type": "bool",
-    "default": false
+    "default": false,
+    "hint": "开启后，在下面选中的群里直接发标签（例如「猫」）或「来张猫」就会回图，不用 @机器人。收图、删图等命令仍按上一项的规则。"
   },
-  "library_scope": {
-    "description": "图库范围",
-    "type": "string",
-    "default": "shared",
-    "options": [
-      "shared",
-      "group"
-    ],
-    "labels": [
-      "所有群共用一个图库",
-      "每个群使用自己的图库"
-    ],
-    "subtitles": [
-      "在任一群收集的图，各群都能搜到和发送",
-      "各群只看到本群收集的图和网页导入的图"
-    ],
-    "hint": "切换后不会移动或删除任何图片，只改变各群能看到的范围。同一张图被多个群收集时，这些群都能看到。"
+  "free_trigger_groups": {
+    "description": "免 @ 斗图的群",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "default": [],
+    "_special": "umo",
+    "hint": "留空表示所有群。建议先在一两个群里试用。"
+  },
+  "natural_trigger": {
+    "description": "识别「来张猫」这类说法",
+    "type": "bool",
+    "default": true,
+    "hint": "支持「来张猫」「来两张猫图」「整点猫猫头表情包」「猫图」等说法，数量最多取「每次最多发送张数」。"
+  },
+  "group_cooldown": {
+    "description": "免 @ 斗图的群冷却（秒）",
+    "type": "int",
+    "default": 5,
+    "slider": {
+      "min": 0,
+      "max": 120,
+      "step": 1
+    },
+    "hint": "不 @ 机器人触发时，同一个群两次回图的最短间隔，防止刷屏。"
   },
   "commands": {
     "description": "触发词别名",
@@ -46,6 +56,17 @@
         }
       }
     }
+  },
+  "case_sensitive": {
+    "description": "搜图和快捷斗图区分大小写",
+    "type": "bool",
+    "default": false
+  },
+  "partial_match": {
+    "description": "搜图时也匹配标签的一部分",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，「搜图 猫」也能找到「猫猫头」「橘猫」；完全一致的标签排在前面。直接发标签斗图始终要求完全一致。"
   },
   "multi_reply_mode": {
     "description": "快捷斗图发几张",
@@ -75,16 +96,16 @@
     },
     "hint": "一次发多张原图容易触发平台频率限制，建议不超过 3。"
   },
-  "recent_window": {
-    "description": "防重复：每个群记住最近几次发图",
+  "repeat_hours": {
+    "description": "防重复：同一个群多久内不重复发同一张（小时）",
     "type": "int",
-    "default": 10,
+    "default": 6,
     "slider": {
-      "min": 1,
-      "max": 100,
+      "min": 0,
+      "max": 72,
       "step": 1
     },
-    "hint": "随机发图会先避开这些图；可选的图不够时，从最久没发的开始轮换。"
+    "hint": "发图记录保存在数据库里，重启后仍然有效。可选的图都发过时，从最久没发的开始轮换。选图时会少发本群常发和被「换一张」的图，多发新收的和被夸「好图」的图。"
   },
   "send_cooldown": {
     "description": "发图冷却（秒）",
@@ -106,6 +127,128 @@
       "max": 12,
       "step": 3
     }
+  },
+  "send_limit_mb": {
+    "description": "发图大小上限（MB）",
+    "type": "int",
+    "default": 10,
+    "slider": {
+      "min": 0,
+      "max": 30,
+      "step": 1
+    },
+    "hint": "超过上限的原图会自动压缩一份再发（GIF 保持动图），原图不变。0 表示不压缩。"
+  },
+  "merge_images": {
+    "description": "一次发多张时合成一条消息",
+    "type": "bool",
+    "default": true,
+    "hint": "可以节省 QQ 官方机器人等平台的回复次数；平台不支持时会自动改为逐张发送。"
+  },
+  "banter_enabled": {
+    "description": "接梗模式",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后，群友的消息里提到某个标签，或者发了一张表情，机器人会按概率回一张图。带冷却，不会回复 @机器人 的消息。"
+  },
+  "banter_groups": {
+    "description": "接梗的群",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "default": [],
+    "_special": "umo",
+    "hint": "留空表示所有群。"
+  },
+  "banter_chance": {
+    "description": "接梗概率（%）",
+    "type": "int",
+    "default": 15,
+    "slider": {
+      "min": 1,
+      "max": 100,
+      "step": 1
+    }
+  },
+  "banter_cooldown": {
+    "description": "接梗冷却（秒）",
+    "type": "int",
+    "default": 300,
+    "slider": {
+      "min": 10,
+      "max": 3600,
+      "step": 10
+    },
+    "hint": "同一个群两次接梗的最短间隔。"
+  },
+  "banter_images": {
+    "description": "群友发表情时也接梗",
+    "type": "bool",
+    "default": true,
+    "hint": "按图库里同类图片的标签挑一张回过去，不会发回同一张图。"
+  },
+  "library_scope": {
+    "description": "图库范围",
+    "type": "string",
+    "default": "shared",
+    "options": [
+      "shared",
+      "group"
+    ],
+    "labels": [
+      "所有群共用一个图库",
+      "每个群使用自己的图库"
+    ],
+    "subtitles": [
+      "在任一群收集的图，各群都能搜到和发送",
+      "各群只看到本群收集的图，以及网页导入和早期导入的图"
+    ],
+    "hint": "切换后不会移动或删除任何图片，只改变各群能看到的范围。同一张图被多个群收集时，这些群都能看到。"
+  },
+  "collect_admin_only": {
+    "description": "只允许管理员收集图片",
+    "type": "bool",
+    "default": false
+  },
+  "review_mode": {
+    "description": "群友投稿需要审核",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后，非管理员收集的图先进「待审核」，管理员在网页图库里通过后才能搜到和发送。"
+  },
+  "allow_owner_manage": {
+    "description": "允许收集者管理自己的图片",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，收集者可以改标签、删除和恢复自己收集的图；没有收集者记录的图只能由管理员管理。"
+  },
+  "auto_collect": {
+    "description": "自动收集群里流行的图",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后，在下面选中的群里，同一张图被几个不同的人发过，就自动收进「待整理」。只收录、不发送；需要群友知情时再开启。"
+  },
+  "auto_collect_groups": {
+    "description": "自动收集的群",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "default": [],
+    "_special": "umo",
+    "hint": "留空表示所有群。"
+  },
+  "auto_collect_senders": {
+    "description": "几个人发过才自动收集",
+    "type": "int",
+    "default": 2,
+    "slider": {
+      "min": 2,
+      "max": 10,
+      "step": 1
+    },
+    "hint": "只统计 24 小时内的消息；压缩、转发后变得不同的同一张图也算。"
   },
   "max_image_mb": {
     "description": "单张图片大小上限（MB）",
@@ -131,17 +274,6 @@
     "description": "下载图片时使用 AstrBot 的代理设置",
     "type": "bool",
     "default": true
-  },
-  "collect_admin_only": {
-    "description": "只允许管理员收集图片",
-    "type": "bool",
-    "default": false
-  },
-  "allow_owner_manage": {
-    "description": "允许收集者管理自己的图片",
-    "type": "bool",
-    "default": true,
-    "hint": "开启后，收集者可以改标签、删除和恢复自己收集的图；没有收集者记录的图只能由管理员管理。"
   },
   "group_whitelist": {
     "description": "只在这些群里使用",
@@ -181,6 +313,27 @@
     },
     "default": [],
     "_special": "sender_id"
+  },
+  "auto_backup_days": {
+    "description": "自动备份间隔（天）",
+    "type": "int",
+    "default": 7,
+    "slider": {
+      "min": 0,
+      "max": 30,
+      "step": 1
+    },
+    "hint": "备份保存在插件数据目录的 backups 文件夹里，包含全部图片和标签。0 表示关闭。"
+  },
+  "auto_backup_keep": {
+    "description": "保留几份自动备份",
+    "type": "int",
+    "default": 3,
+    "slider": {
+      "min": 1,
+      "max": 10,
+      "step": 1
+    }
   },
   "ai_enabled": {
     "description": "开启 AI 识图和 AI 搜图",

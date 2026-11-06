@@ -70,6 +70,7 @@ input[type=checkbox]{accent-color:var(--accent);width:17px;height:17px;margin:0;
 .toolbar > input.grow{min-width:180px}
 .pill{font-size:12px;padding:2px 9px;border-radius:99px;background:var(--surface-2);color:var(--muted)}
 .notice{background:var(--warn-soft);color:var(--warn);padding:10px 14px;border-radius:var(--radius-s);margin:10px 0}
+.notice .row{margin-top:8px}
 .good{color:var(--ok);font-weight:600;font-size:13px}
 .bad{color:var(--danger);font-size:13px}
 .card{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:18px 20px;box-shadow:var(--shadow);min-width:0}
@@ -83,6 +84,8 @@ input[type=checkbox]{accent-color:var(--accent);width:17px;height:17px;margin:0;
 .tab{border-color:transparent;background:transparent;color:var(--muted);border-radius:99px;padding:6px 14px}
 .tab small{margin-left:4px;font-size:12px;opacity:.8}
 .tab.on{background:var(--accent-soft);color:var(--accent);font-weight:600}
+.tab.attention small{background:var(--warn-soft);color:var(--warn);padding:0 7px;border-radius:99px;opacity:1}
+.page.insights > .card{margin-bottom:16px}
 .skeleton{display:block;width:100%;height:100%;min-height:24px;border-radius:8px;background:linear-gradient(90deg,var(--surface-2) 25%,var(--surface-3) 50%,var(--surface-2) 75%) 0 0/300% 100%;animation:shimmer 1.4s infinite linear}
 .skeleton.block{height:260px;border-radius:var(--radius)}
 @keyframes shimmer{to{background-position:-150% 0}}

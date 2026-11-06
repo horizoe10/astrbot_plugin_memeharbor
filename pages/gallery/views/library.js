@@ -4,7 +4,7 @@ import { Empty, Icon, TagInput, Tags, Thumb, chatCommand, copy, describeQuery, r
 import { changed } from '../detail.js';
 import { confirm, fail, go, set, toast, useStore } from '../store.js';
 
-const VIEWS = [['all', '全部', 'all'], ['inbox', '待整理', 'inbox'], ['trash', '回收站', 'trash']];
+const VIEWS = [['all', '全部'], ['inbox', '待整理'], ['review', '待审核'], ['trash', '回收站']];
 const GAP = 8;
 
 /** Justified rows (like photo apps): each row is scaled to fill the width. */
@@ -57,7 +57,7 @@ export function Library() {
   const params = route.params;
   const view = params.get('view') || 'all';
   const q = params.get('q') || '';
-  const sort = params.get('sort') || 'new';
+  const sort = params.get('sort') || (q ? 'best' : 'new');
   const [items, setItems] = useState([]);
   const [total, setTotal] = useState(null);
   const [width, setWidth] = useState(0);
@@ -131,6 +131,7 @@ export function Library() {
   const batch = async (name) => {
     if (!count) return;
     if ((name === 'add' || name === 'remove') && !batchTags.length) return toast('先输入要添加或移除的标签', 'error');
+    if (name === 'reject' && !(await confirm('不通过投稿', '把所选的 ' + count + ' 张投稿移入回收站？之后可以恢复。', '不通过'))) return;
     if (name === 'delete' && !(await confirm('移入回收站', '把所选的 ' + count + ' 张图片移入回收站？之后可以恢复。', '移入回收站'))) return;
     const result = await api.action(name, { tags: batchTags.join(' '), ...payload() });
     toast(result.message, 'ok', result.undo);
@@ -145,12 +146,12 @@ export function Library() {
       <div class="toolbar">
         <${QueryBox} value=${q} onSubmit=${(text) => nav({ q: text })} />
         <select value=${sort} aria-label="排序" onChange=${(e) => nav({ sort: e.currentTarget.value })}>
-          <option value="new">最新收集</option><option value="old">最早收集</option><option value="sent">最常发送</option><option value="inbox">待整理优先</option>
+          ${q ? html`<option value="best">最相关</option>` : null}<option value="new">最新收集</option><option value="old">最早收集</option><option value="sent">最常发送</option><option value="inbox">待整理优先</option>
         </select>
         <button onClick=${() => window.dispatchEvent(new CustomEvent('mh:import', { detail: 'files' }))}><${Icon} name="upload" /> 导入</button>
       </div>
       <div class="tabs">
-        ${VIEWS.map(([key, label]) => html`<button key=${key} class=${'tab' + (view === key ? ' on' : '')} onClick=${() => nav({ view: key })}>${label}<small>${counts[key] ?? ''}</small></button>`)}
+        ${VIEWS.filter(([key]) => key !== 'review' || counts.review || view === 'review').map(([key, label]) => html`<button key=${key} class=${'tab' + (view === key ? ' on' : '') + (key === 'review' ? ' attention' : '')} onClick=${() => nav({ view: key })}>${label}<small>${counts[key] ?? ''}</small></button>`)}
         <span class="grow"></span>
         ${q ? html`<span class="interpret" title=${meaning}>${meaning ? meaning + ' · ' : ''}在群里发：<code>${command}</code><button class="link" onClick=${() => copy(command).then((ok) => toast(ok ? '已复制「' + command + '」' : '复制失败', ok ? 'ok' : 'error'))}>复制</button></span>` : null}
         <span class="muted">${total === null ? '加载中…' : total + ' 张'}</span>
@@ -170,12 +171,14 @@ export function Library() {
         </div>`;
       }))}
     </div>
-    ${total === 0 ? html`<${Empty} title=${view === 'trash' ? '回收站是空的' : view === 'inbox' ? '没有待整理的图片' : q ? '没有找到匹配的图片' : '图库还是空的'}
+    ${total === 0 ? html`<${Empty} title=${view === 'trash' ? '回收站是空的' : view === 'inbox' ? '没有待整理的图片' : view === 'review' ? '没有等待审核的投稿' : q ? '没有找到匹配的图片' : '图库还是空的'}
       hint=${q ? '换个标签试试，或者看看「标签」页有哪些可用的词' : view === 'all' ? '把图片、ZIP 或整个文件夹拖进页面即可导入' : ''} />` : null}
     ${count ? html`<div class="batchbar" role="region" aria-label="批量操作">
       <strong>${allResults ? '已选中全部 ' + total + ' 张' : '已选 ' + count + ' 张'}</strong>
       ${!allResults && total > count ? html`<button class="link" onClick=${() => setAll(true)}>选中全部 ${total} 张结果</button>` : null}
-      ${view !== 'trash' ? html`<${TagInput} compact=${true} value=${batchTags} onChange=${setBatchTags} placeholder="要加减的标签" onSubmit=${() => batch('add').catch(fail)} />
+      ${view === 'review' ? html`<button class="primary" onClick=${() => batch('approve').catch(fail)}>通过，群里可以搜到</button>
+        <button class="danger" onClick=${() => batch('reject').catch(fail)}>不通过</button>`
+        : view !== 'trash' ? html`<${TagInput} compact=${true} value=${batchTags} onChange=${setBatchTags} placeholder="要加减的标签" onSubmit=${() => batch('add').catch(fail)} />
         <button onClick=${() => batch('add').catch(fail)}>添加标签</button><button onClick=${() => batch('remove').catch(fail)}>移除标签</button>
         <button class="danger" onClick=${() => batch('delete').catch(fail)}>移入回收站</button>`
         : html`<button class="primary" onClick=${() => batch('restore').catch(fail)}>恢复所选</button>`}

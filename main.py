@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import random
 import re
 import time
-from collections import OrderedDict, deque
+from collections import OrderedDict
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -14,7 +15,16 @@ from astrbot.api.message_components import Image, Plain
 from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core.star.star_handler import star_handlers_registry
 
-from .library import INBOX_TAGS, Library, render_preview, tags_from
+from .library import (
+    INBOX_TAGS,
+    SIMILAR_DISTANCE,
+    Library,
+    analyze,
+    hash_distance,
+    hash_parts,
+    render_preview,
+    tags_from,
+)
 from .media import MediaLoader
 from .web_api import GalleryAPI
 
@@ -46,12 +56,27 @@ COMMANDS = {
     "斗图帮助",
     "识图",
     "AI搜图",
+    "回一张",
+    "撤销修改",
 }
 # Common words other plugins also use. They are never registered as commands:
 # paging words answer only during this user's own browsing session, and the
 # rest are reachable through the plugin prefix, e.g. "斗图 回收站".
 PAGE_WORDS = {"下一页", "上一页"}
 PREFIXES = {"memeharbor", "斗图"}
+# Answered only right after this plugin sent a picture in the same chat.
+REROLL_WORDS = {"换一张", "换一个", "换张", "再来", "再来一张", "再来一个"}
+LIKE_WORDS = {"好图", "这张好", "好评"}
+# Quote or attach a picture and send one of these to get a matching one back.
+REPLY_WORDS = {"回一张", "回图", "接一张", "斗一张", "以图回图"}
+# "3", "发 3", "发 1 3", "第3张": pick from the preview the user is browsing.
+PICK = re.compile(r"^(?:发|要|取|第)?\s*([1-9]\d?(?:\s*[,，、\s]\s*[1-9]\d?)*)\s*张?$")
+# "来张猫" "来两张猫图" "整点猫猫头表情包"
+NATURAL = re.compile(
+    r"^(?:来|整|发|要)\s*([一二两三俩仨几1-9]?)\s*(?:张|个|点|份|波|些)\s*(.+)$"
+)
+SUFFIXES = ("的表情包", "表情包", "的表情", "表情", "的图片", "图片", "的图", "图")
+COUNT_WORDS = {"一": 1, "二": 2, "两": 2, "俩": 2, "三": 3, "仨": 3, "几": 3}
 HELP = """表情港湾 MemeHarbor 使用说明
 
 【收图】
@@ -66,15 +91,19 @@ HELP = """表情港湾 MemeHarbor 使用说明
 查看图片：浏览全部，之后可发「下一页」「上一页」
 
 【发图】
+搜图后回复序号就能取图，例如「3」或「发 1 3」
 发图 12：按编号发原图
-随机图 猫 3：随机发几张，避开最近发过的
-直接发送已有标签，例如「猫」：快速斗图
+随机图 猫 3：随机发几张，避开本群最近发过的
+直接发送已有标签，例如「猫」，或说「来张猫」「来两张猫图」：快速斗图
+机器人发图后 2 分钟内说「换一张」可以换，说「好图」会让它以后多发
+引用一张表情发「回一张」：找一张同类的图回过去
 
 【整理】
 图片详情 12 · 标签列表 · 图库统计
 标签添加 12 可爱 · 标签移除 12 憋笑
 标签重命名 旧 新（管理员）
 删除图片 12 · 图片回收站 · 恢复图片 12
+撤销修改：撤销你最近一次改标签或删除（管理员可撤销任何人的）
 
 【AI（需在插件配置中开启）】
 识图 12 · AI搜图 一只生气的猫
@@ -115,10 +144,47 @@ class MemeHarborPlugin(Star, GalleryAPI):
         self.ai_lock = asyncio.Semaphore(1)
         self.pages = OrderedDict()
         self.pending = OrderedDict()
-        self.recent = OrderedDict()
         self.cooldowns = OrderedDict()
         self.ai_cooldowns = OrderedDict()
+        self.sessions = OrderedDict()  # chat -> last sent pictures, for 换一张
+        self.group_cooldowns = OrderedDict()
+        self.banter_at = OrderedDict()
+        self.sightings = OrderedDict()  # chat -> pictures seen, for auto collect
+        self.tasks = set()
         self.register_gallery(context)
+
+    async def initialize(self):
+        self.spawn(self.backup_loop())
+
+    def spawn(self, coroutine):
+        task = asyncio.create_task(coroutine)
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+        return task
+
+    @property
+    def backups(self):
+        return self.library.root / "backups"
+
+    async def backup_loop(self):
+        """Write a backup every few days (0 turns it off); checks once an hour."""
+        while True:
+            try:
+                days = self.number("auto_backup_days", 7, 0, 60)
+                last = await asyncio.to_thread(Library.last_backup, self.backups)
+                if days and (last is None or time.time() - last >= days * 86400):
+                    async with self.mutation:
+                        await asyncio.to_thread(
+                            self.library.backup,
+                            self.backups,
+                            self.number("auto_backup_keep", 3, 1, 20),
+                        )
+                    logger.info("MemeHarbor wrote an automatic backup")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("MemeHarbor automatic backup failed", exc_info=True)
+            await asyncio.sleep(3600)
 
     def number(self, key, default, low, high):
         try:
@@ -204,6 +270,8 @@ class MemeHarborPlugin(Star, GalleryAPI):
         await event.send(event.plain_result(text))
 
     async def terminate(self):
+        for task in list(self.tasks):
+            task.cancel()
         await self.media.close()
 
     @staticmethod
@@ -255,7 +323,13 @@ class MemeHarborPlugin(Star, GalleryAPI):
         if not self.allowed(event):
             return
         command, args = self.split(event.message_str or "")
-        if command in COMMANDS or command in PREFIXES:
+        free_reply = (
+            command in REPLY_WORDS
+            and not args
+            and not self.woken(event)
+            and self.free(event)
+        )
+        if (command in COMMANDS or command in PREFIXES) and not free_reply:
             # Bare commands need framework wake recognition. Support an explicit
             # slash, or bare commands when this plugin disables wake.
             if not self.woken(event):
@@ -281,93 +355,383 @@ class MemeHarborPlugin(Star, GalleryAPI):
             if matched:
                 await self.command(event)
             return
-        if command in PAGE_WORDS and not args and self.woken(event):
-            # Only claim the word while this user is paging through our results.
-            if self.browsing(event) and not event.get_extra(
-                "memeharbor_command_handled", False
-            ):
+        state = self.browsing(event)
+        text = (event.message_str or "").strip()
+        if state and not event.get_extra("memeharbor_command_handled", False):
+            # The user's own preview session claims numbers ("3", "发 1 3") and,
+            # when woken, the paging words other plugins may also use.
+            numbers = self.parse_pick(text)
+            if (command in PAGE_WORDS and not args and self.woken(event)) or numbers:
                 event.set_extra("memeharbor_command_handled", True)
                 event.stop_event()
-                await self.handle(event, command, "")
+                if numbers:
+                    await self.guard(event, self.send_from_page(event, state, numbers))
+                else:
+                    await self.handle(event, command, "")
+                return
+        if command in PAGE_WORDS:
             return
+        if self.auto_collect_on(event) and self.media.has_direct_image(event):
+            self.spawn(self.watch_images(event))
         key = self.user_key(event)
         pending = self.pending.get(key)
         if pending and pending[0] < time.monotonic():
             self.pending.pop(key, None)
             pending = None
-        try:
-            if pending and self.media.has_media(event):
-                event.stop_event()
-                await self.collect(event, pending[1], allow_pending=False)
-                return
-            if self.config.get("require_wake", True) and not getattr(
-                event, "is_at_or_wake_command", False
-            ):
-                return
-            if not command or args:
-                return
-            tag = command
-            for item in self.config.get("commands", []) or []:
-                source, target = (
-                    (item, item)
-                    if isinstance(item, str)
-                    else (
-                        item.get("command"),
-                        item.get("prefix") or item.get("command"),
-                    )
-                    if isinstance(item, dict)
-                    else (None, None)
-                )
-                if source and (
-                    source == command
-                    if self.config.get("case_sensitive", False)
-                    else source.casefold() == command.casefold()
-                ):
-                    tag = target
-                    break
-            else:
-                tag = self.library.alias_target(command) or command
-            items = await self.search(tag, event=event)
-            # Quick replies require an exact tag, so casual chat never matches OCR.
-            normalize = (
-                (lambda x: x)
-                if self.config.get("case_sensitive", False)
-                else str.casefold
+        if pending and self.media.has_media(event):
+            event.stop_event()
+            await self.guard(
+                event, self.collect(event, pending[1], allow_pending=False)
             )
-            items = [
-                item
-                for item in items
-                if normalize(tag) in [normalize(t) for t in item["tags"]]
-            ]
-            if items:
+            return
+        session = self.session(event)
+        if session and text in REROLL_WORDS:
+            event.stop_event()
+            await self.guard(event, self.reroll(event, session))
+            return
+        if session and text in LIKE_WORDS:
+            await asyncio.to_thread(
+                self.library.feedback, self.scope(event), session["last"], 1
+            )
+            return
+        woken = self.woken(event)
+        free = self.free(event)
+        try:
+            if (
+                command in REPLY_WORDS
+                and not args
+                and (woken or free)
+                and self.media.has_media(event)
+            ):
                 event.stop_event()
-                count = (
-                    self.number("max_send_count", 3, 1, 3)
-                    if self.config.get("multi_reply_mode") == "all"
-                    else 1
-                )
-                await self.send_images(event, items, count)
+                await self.reply_with_image(event, explicit=woken)
+                return
+            if (woken or free) and await self.quick_tag(event, text, woken):
+                return
+            if not getattr(event, "is_at_or_wake_command", False):
+                await self.banter(event, text)
         except ValueError as exc:
-            await self.say(event, str(exc))
+            if woken:
+                await self.say(event, str(exc))
         except Exception:
             logger.exception("MemeHarbor quick reply failed")
 
-    async def search(self, query="", deleted=False, event=None):
+    async def guard(self, event, coroutine):
+        try:
+            await coroutine
+        except ValueError as exc:
+            await self.say(event, str(exc))
+        except Exception:
+            logger.exception("MemeHarbor chat action failed")
+            await self.say(event, "操作没有完成，请稍后再试")
+
+    # ---------- quick replies ----------
+
+    def in_groups(self, event, key):
+        """True for a group chat listed under key; an empty list means every group."""
+        group = str(event.get_group_id() or "")
+        if not group:
+            return False
+        chosen = {str(v) for v in self.config.get(key, []) or []}
+        return not chosen or bool(
+            chosen & {group, str(getattr(event, "unified_msg_origin", "") or "")}
+        )
+
+    def free(self, event):
+        return bool(self.config.get("free_trigger", False)) and self.in_groups(
+            event, "free_trigger_groups"
+        )
+
+    def auto_collect_on(self, event):
+        return bool(self.config.get("auto_collect", False)) and self.in_groups(
+            event, "auto_collect_groups"
+        )
+
+    def banter_on(self, event):
+        return bool(self.config.get("banter_enabled", False)) and self.in_groups(
+            event, "banter_groups"
+        )
+
+    @staticmethod
+    def parse_pick(text):
+        match = PICK.match(text or "")
+        if not match:
+            return []
+        return [int(n) for n in re.split(r"[,，、\s]+", match[1]) if n]
+
+    def fold(self, value):
+        return value if self.config.get("case_sensitive", False) else value.casefold()
+
+    def trigger_target(self, word):
+        """Configured trigger word, alias or the word itself."""
+        for item in self.config.get("commands", []) or []:
+            source, target = (
+                (item, item)
+                if isinstance(item, str)
+                else (item.get("command"), item.get("prefix") or item.get("command"))
+                if isinstance(item, dict)
+                else (None, None)
+            )
+            if source and self.fold(source) == self.fold(word):
+                return target
+        return self.library.alias_target(word) or word
+
+    async def tagged(self, tag, event):
+        """Images carrying exactly this tag, so casual chat never matches OCR."""
+        items = await self.search(tag, event=event)
+        return [i for i in items if self.fold(tag) in [self.fold(t) for t in i["tags"]]]
+
+    def natural_words(self, text):
+        """Possible tags in "来张猫", "来两张猫图", "猫猫头表情包" and the count asked for."""
+        if not self.config.get("natural_trigger", True):
+            return 0, [], False
+        match = NATURAL.match(text)
+        count, rest, explicit = 0, text, bool(match)
+        if match:
+            amount, rest = match.groups()
+            count = int(amount) if amount.isdigit() else COUNT_WORDS.get(amount, 0)
+        rest = rest.strip().rstrip("!！。.~～")
+        words = [rest] if match else []
+        for suffix in SUFFIXES:
+            if rest.endswith(suffix) and len(rest) > len(suffix):
+                words.append(rest[: -len(suffix)])
+                break
+        return count, words, explicit
+
+    async def quick_tag(self, event, text, woken):
+        command, args = self.split(text)
+        words = [command] if command and not args else []
+        count, natural, explicit = self.natural_words(text)
+        words += [w for w in natural if w not in words]
+        for word in words:
+            tag = self.trigger_target(word)
+            items = await self.tagged(tag, event)
+            if items:
+                break
+        else:
+            if woken and explicit:
+                hints = await asyncio.to_thread(
+                    self.library.suggest, natural[-1], self.visible(event)
+                )
+                if hints:
+                    await self.say(
+                        event,
+                        f"没有「{natural[-1]}」的图，试试："
+                        + "、".join(f"{t}（{n} 张）" for t, n in hints),
+                    )
+                    event.stop_event()
+                    return True
+            return False
+        scope = self.scope(event)
+        if not woken:
+            # Without @, keep a group from being flooded by repeated words.
+            wait = self.number("group_cooldown", 5, 0, 600)
+            if time.monotonic() - self.group_cooldowns.get(scope, 0) < wait:
+                return True
+            self.remember(self.group_cooldowns, scope, time.monotonic())
+        event.stop_event()
+        if not count:
+            count = (
+                self.number("max_send_count", 3, 1, 3)
+                if self.config.get("multi_reply_mode") == "all"
+                else 1
+            )
+        await self.send_images(
+            event, items, count, kind="quick", query=tag, quiet=not woken
+        )
+        return True
+
+    def banter_tag(self, text, visible):
+        """The longest tag or alias mentioned in a chat message."""
+        counts = self.library.tag_counts(visible)
+        names = {t: t for t in counts if t not in INBOX_TAGS}
+        for alias, tag in self.library.aliases().items():
+            if tag in counts:
+                names.setdefault(alias, tag)
+        folded = self.fold(text)
+        best = None
+        for name, tag in names.items():
+            key = self.fold(name)
+            # One-character tags only count in short messages like "猫猫猫".
+            if key and key in folded and (len(key) >= 2 or len(text) <= 8):
+                if best is None or len(key) > len(best[0]):
+                    best = (key, tag)
+        return best[1] if best else None
+
+    async def banter(self, event, text):
+        """Banter mode: now and then answer a mentioned tag or a posted sticker."""
+        if not self.banter_on(event):
+            return
+        scope = self.scope(event)
+        wait = self.number("banter_cooldown", 300, 10, 86400)
+        if time.monotonic() - self.banter_at.get(scope, 0) < wait:
+            return
+        chance = self.number("banter_chance", 15, 1, 100)
+        if self.media.has_direct_image(event) and not text:
+            if (
+                not self.config.get("banter_images", True)
+                or random.random() * 100 >= chance
+            ):
+                return
+            self.remember(self.banter_at, scope, time.monotonic())
+            images = await self.media.load_direct(event, 1)
+            if images:
+                await self.reply_with_image(event, images[0], explicit=False)
+            return
+        if not text or len(text) > 40 or text.startswith(("/", "／")):
+            return
+        tag = await asyncio.to_thread(self.banter_tag, text, self.visible(event))
+        if not tag or random.random() * 100 >= chance:
+            return
+        items = await self.tagged(tag, event)
+        if items:
+            self.remember(self.banter_at, scope, time.monotonic())
+            await self.send_images(
+                event, items, 1, kind="banter", query=tag, quiet=True
+            )
+
+    async def reply_with_image(self, event, data=None, explicit=True):
+        """Answer a picture with a different one that shares its likely tags."""
+        if data is None:
+            images, _ = await self.media.load(event)
+            if not images:
+                raise ValueError("没读到图片，请引用一张表情图再发「回一张」")
+            data = images[0]
+        facts = await asyncio.to_thread(analyze, data)
+        items, tags = await asyncio.to_thread(
+            self.library.image_reply,
+            facts["phash"],
+            self.visible(event),
+            hashlib.sha256(data).hexdigest(),
+        )
+        if not items:
+            if explicit:
+                raise ValueError("图库里还没有和这张同类的图，先收集几张吧")
+            return
+        await self.send_images(
+            event,
+            items,
+            1,
+            kind="image" if explicit else "banter",
+            query=" ".join(tags),
+            quiet=not explicit,
+        )
+
+    async def watch_images(self, event):
+        """Auto collect: a picture posted by several different people gets saved."""
+        try:
+            scope = self.scope(event)
+            sender = str(event.get_sender_id())
+            need = self.number("auto_collect_senders", 2, 2, 20)
+            for data in await self.media.load_direct(event, 2):
+                facts = await asyncio.to_thread(analyze, data)
+                if not facts["phash"]:
+                    continue
+                value = hash_parts(facts["phash"])
+                now = time.monotonic()
+                seen = [
+                    s for s in self.sightings.get(scope, []) if now - s["at"] < 86400
+                ][-300:]
+                match = next(
+                    (
+                        s
+                        for s in seen
+                        if hash_distance(s["hash"], value) <= SIMILAR_DISTANCE
+                    ),
+                    None,
+                )
+                if match is None:
+                    seen.append(
+                        {"hash": value, "senders": {sender}, "at": now, "done": False}
+                    )
+                else:
+                    match["senders"].add(sender)
+                self.remember(self.sightings, scope, seen)
+                if match is None or match["done"] or len(match["senders"]) < need:
+                    continue
+                match["done"] = True
+                near = await asyncio.to_thread(
+                    self.library.nearest, facts["phash"], None, 1
+                )
+                if near and near[0][0] <= SIMILAR_DISTANCE:
+                    continue
+                async with self.mutation:
+                    await asyncio.to_thread(
+                        self.library.add, data, ["待整理"], "auto", scope
+                    )
+                logger.info("MemeHarbor auto-collected a popular picture into triage")
+        except Exception:
+            logger.debug("MemeHarbor auto collect skipped a picture", exc_info=True)
+
+    def session(self, event):
+        state = self.sessions.get(self.scope(event))
+        return state if state and state["expires"] >= time.monotonic() else None
+
+    async def reroll(self, event, session):
+        scope = self.scope(event)
+        await asyncio.to_thread(self.library.feedback, scope, session["last"], -1)
+        left = [i for i in session["pool"] if i not in session["sent"]]
+        if not left:
+            raise ValueError("这组图都发过了，换个标签试试")
+        items = []
+        for image_id in left:
+            try:
+                items.append(await asyncio.to_thread(self.library.get, image_id))
+            except ValueError:
+                continue
+        if not items:
+            raise ValueError("这组图都发过了，换个标签试试")
+        await self.send_images(
+            event,
+            items,
+            len(session["last"]) or 1,
+            kind="reroll",
+            query=session["query"],
+            session=session,
+        )
+
+    async def send_from_page(self, event, state, numbers):
+        selection = state.get("selection") or []
+        if not selection:
+            raise ValueError("请先搜图，再回复序号")
+        if state["deleted"]:
+            raise ValueError("回收站里的图要先恢复，发送「恢复图片 编号」")
+        maximum = self.number("max_send_count", 3, 1, 3)
+        numbers = list(dict.fromkeys(numbers))
+        if len(numbers) > maximum:
+            raise ValueError(f"一次最多取 {maximum} 张")
+        if any(n < 1 or n > len(selection) for n in numbers):
+            raise ValueError(f"这一页的序号是 1～{len(selection)}")
+        items = [await self.fetch(event, selection[n - 1]) for n in numbers]
+        await self.send_images(event, items, len(items), explicit=True, kind="page")
+
+    async def search(
+        self, query="", deleted=False, event=None, sort="new", partial=False
+    ):
         if len(query) > 200:
             raise ValueError("搜索条件请控制在 200 字以内")
+        boost = None
+        if sort == "best" and event is not None:
+            stats = await asyncio.to_thread(self.library.send_stats, self.scope(event))
+            boost = {
+                k: v["sends"] + 2 * v["likes"] - v["swaps"] for k, v in stats.items()
+            }
         return await asyncio.to_thread(
             self.library.search,
             query,
             deleted,
             bool(self.config.get("case_sensitive", False)),
-            "new",
+            sort,
             self.visible(event),
+            partial,
+            False,
+            boost,
         )
 
     async def collect(self, event, args, allow_pending=True):
         if self.config.get("collect_admin_only", False) and not self.admin(event):
             raise ValueError("目前只有管理员可以收集图片")
-        labels = tags_from(args) or ["待整理"]
+        labels = self.library.canonical(tags_from(args)) or ["待整理"]
         images, errors = await self.media.load(event)
         if not images:
             if errors:
@@ -385,38 +749,100 @@ class MemeHarborPlugin(Star, GalleryAPI):
                 )
                 return
             raise ValueError("没找到图片，请把图片和「收集 标签」一起发送")
-        added = merged = 0
+        review = bool(self.config.get("review_mode", False)) and not self.admin(event)
+        added = merged = inherited = similar = 0
+        untagged = all(t in INBOX_TAGS for t in labels)
         async with self.mutation:
+            fresh = []
             for data in images:
-                _, duplicate = await asyncio.to_thread(
-                    self.library.add, data, labels, self.owner(event), self.scope(event)
+                item, duplicate = await asyncio.to_thread(
+                    self.library.add,
+                    data,
+                    labels,
+                    self.owner(event),
+                    self.scope(event),
+                    True,
+                    review,
                 )
                 merged += duplicate
                 added += not duplicate
+                if not duplicate and not review:
+                    fresh.append(item)
+            for item in fresh:
+                # A near copy of a known picture: reuse its tags if none were given.
+                near = await asyncio.to_thread(
+                    self.library.nearest, item["phash"], None, 1, {item["id"]}
+                )
+                if not near or near[0][0] > SIMILAR_DISTANCE:
+                    continue
+                known = [t for t in near[0][1]["tags"] if t not in INBOX_TAGS]
+                if untagged and known:
+                    await asyncio.to_thread(
+                        self.library.update_tags, [item["id"]], "replace", known
+                    )
+                    inherited += 1
+                else:
+                    similar += 1
         self.pending.pop(self.user_key(event), None)
-        if added and merged:
-            head = f"✅ 收好了：新增 {added} 张，另有 {merged} 张已在图库中，已补上标签"
-        elif added:
-            head = f"✅ 收好了：新增 {added} 张"
+        if review:
+            lines = [
+                f"📥 收到了：{added} 张已提交，管理员审核通过后就能搜到"
+                if added
+                else "📥 这些图片已在图库中"
+            ]
+            if added and merged:
+                lines.append(f"另有 {merged} 张已在图库中")
         else:
-            head = (
-                f"✅ {'这张图片' if merged == 1 else '这些图片'}已在图库中，已补上标签"
-            )
-        lines = [head, f"标签：{joined(labels)}"]
+            if added and merged:
+                head = f"✅ 收好了：新增 {added} 张，另有 {merged} 张已在图库中，已补上标签"
+            elif added:
+                head = f"✅ 收好了：新增 {added} 张"
+            else:
+                head = f"✅ {'这张图片' if merged == 1 else '这些图片'}已在图库中，已补上标签"
+            lines = [head]
+            if inherited:
+                lines.append(
+                    f"其中 {inherited} 张和图库里的图几乎一样，已沿用它们的标签"
+                )
+            if similar:
+                lines.append(
+                    f"其中 {similar} 张和图库里的图几乎一样，可以在网页「相似图片」里合并"
+                )
+            if not (untagged and inherited == added and not merged):
+                lines.insert(1, f"标签：{joined(labels)}")
         if errors:
             lines.append(f"⚠️ 有 {len(errors)} 项没读到：{reasons(errors)}")
-        lines.append(f"发送「搜图 {labels[0]}」就能找到")
+        if not review and not untagged:
+            lines.append(f"发送「搜图 {labels[0]}」就能找到")
+        elif not review and untagged and inherited < added:
+            lines.append("还没写标签的图在网页图库的「整理」里")
         await self.say(event, "\n".join(lines))
 
+    def no_result_hint(self, query, terms, event):
+        hints = []
+        for term in terms[:3]:
+            for tag, count in self.library.suggest(term, self.visible(event)):
+                if tag not in [h[0] for h in hints]:
+                    hints.append((tag, count))
+        lines = [f"没有找到「{query}」相关的图片"]
+        if hints:
+            lines.append("试试：" + "、".join(f"{t}（{n} 张）" for t, n in hints[:5]))
+        lines.append("发送「标签列表」看看全部标签")
+        return "\n".join(lines)
+
     async def show_page(self, event, query="", page=1, deleted=False, ids=None):
+        partial = bool(self.config.get("partial_match", True))
+        sort = "best" if query and ids is None else "new"
         if deleted and not self.admin(event):
             items = [
                 i
-                for i in await self.search(query, True, event)
+                for i in await self.search(query, True, event, sort, partial)
                 if i["owner"] == self.owner(event)
             ]
         else:
-            items = await self.search(query if ids is None else "", deleted, event)
+            items = await self.search(
+                query if ids is None else "", deleted, event, sort, partial
+            )
         if ids is not None:
             ranks = {value: index for index, value in enumerate(ids)}
             items = sorted(
@@ -431,11 +857,23 @@ class MemeHarborPlugin(Star, GalleryAPI):
             self.pages.pop(self.user_key(event), None)
             if deleted:
                 await self.say(event, "回收站是空的")
-            elif query:
-                await self.say(
-                    event,
-                    f"没有找到「{query}」相关的图片\n发送「标签列表」看看有哪些标签",
+            elif query and ids is None:
+                terms = [
+                    t
+                    for t in re.split(r"[\s,，、;；|]+", query)
+                    if t and not t.startswith(("-", "#"))
+                ]
+                missing = [
+                    t
+                    for t in terms
+                    if not await self.search(t, event=event, partial=partial)
+                ]
+                hint = await asyncio.to_thread(
+                    self.no_result_hint, query, missing or terms, event
                 )
+                await self.say(event, hint)
+            elif query:
+                await self.say(event, f"没有找到「{query}」相关的图片")
             else:
                 await self.say(
                     event, "图库里还没有图片，发送「收集 标签」并附上图片试试"
@@ -465,7 +903,11 @@ class MemeHarborPlugin(Star, GalleryAPI):
             title = f"搜图「{query}」"
         else:
             title = "全部图片"
-        hint = "发送「恢复图片 编号」可以恢复" if deleted else "发送「发图 编号」取原图"
+        hint = (
+            "发送「恢复图片 编号」可以恢复"
+            if deleted
+            else "回复序号取原图，例如「1」或「发 1 3」"
+        )
         if pages > 1:
             hint += "，「下一页」继续翻"
         await event.send(
@@ -486,11 +928,27 @@ class MemeHarborPlugin(Star, GalleryAPI):
                 "page": page,
                 "deleted": deleted,
                 "ids": ids,
+                "selection": [i["id"] for i in selection],
                 "expires": time.monotonic() + 600,
             },
         )
 
-    async def send_images(self, event, items, count=1, explicit=False):
+    async def send_images(
+        self,
+        event,
+        items,
+        count=1,
+        explicit=False,
+        kind="",
+        query="",
+        quiet=False,
+        session=None,
+    ):
+        """Send pictures to the chat and remember them for 换一张 and repeats.
+
+        Explicit picks (by id or preview number) are sent as asked; otherwise
+        the library chooses, avoiding what this chat got recently.
+        """
         count = min(count, self.number("max_send_count", 3, 1, 3), len(items))
         if not items or count < 1:
             raise ValueError("没有可以发送的图片")
@@ -500,32 +958,103 @@ class MemeHarborPlugin(Star, GalleryAPI):
             cooldown = self.number("send_cooldown", 2, 0, 60)
             elapsed = now - self.cooldowns.get(key, 0)
             if elapsed < cooldown:
+                if quiet:
+                    return []
                 raise ValueError(f"慢一点，{math.ceil(cooldown - elapsed)} 秒后再发")
             scope = self.scope(event)
-            history = self.recent.get(
-                scope, deque(maxlen=self.number("recent_window", 10, 1, 100))
-            )
-            unique = list({item["digest"]: item for item in items}.values())
             if explicit:
-                selected = unique[:count]
+                selected = list({i["digest"]: i for i in items}.values())[:count]
             else:
-                fresh = [i for i in unique if i["digest"] not in history]
-                random.shuffle(fresh)
-                older = [i for i in unique if i["digest"] in history]
-                order = list(history)
-                older.sort(
-                    key=lambda i: len(order) - 1 - order[::-1].index(i["digest"])
+                selected = await asyncio.to_thread(
+                    self.library.pick,
+                    items,
+                    count,
+                    scope,
+                    self.number("repeat_hours", 6, 0, 168),
                 )
-                selected = (fresh + older)[:count]
+            limit = self.number("send_limit_mb", 10, 0, 30) * 1048576
+            paths = []
             for item in selected:
                 current = await asyncio.to_thread(self.library.get, item["id"])
-                path = self.library.path(current)
-                # Use AstrBot's standard image component across adapters.
-                await event.send(event.chain_result([Image.fromFileSystem(str(path))]))
-                history.append(item["digest"])
-                self.remember(self.recent, scope, history)
-                self.remember(self.cooldowns, key, time.monotonic())
+                try:
+                    path = await asyncio.to_thread(
+                        self.library.sendable, current, limit
+                    )
+                except (OSError, ValueError):
+                    path = self.library.path(current)
+                paths.append(str(path))
+            if len(paths) > 1 and self.config.get("merge_images", True):
+                # One message for several pictures saves platform reply quota.
+                try:
+                    await event.send(
+                        event.chain_result([Image.fromFileSystem(p) for p in paths])
+                    )
+                except Exception:
+                    logger.warning("MemeHarbor merged send failed; sending one by one")
+                    for path in paths:
+                        await event.send(
+                            event.chain_result([Image.fromFileSystem(path)])
+                        )
+            else:
+                for path in paths:
+                    await event.send(event.chain_result([Image.fromFileSystem(path)]))
+            for item in selected:
+                await asyncio.to_thread(
+                    self.library.record_send, scope, item, kind, query
+                )
                 await asyncio.to_thread(self.library.mark_sent, item["id"])
+            self.remember(self.cooldowns, key, time.monotonic())
+            ids = [i["id"] for i in selected]
+            if session is not None:
+                session["sent"].update(ids)
+                session["last"] = ids
+                session["expires"] = time.monotonic() + 120
+            else:
+                session = {
+                    "pool": [] if explicit else [i["id"] for i in items][:500],
+                    "sent": set(ids),
+                    "last": ids,
+                    "query": query,
+                    "expires": time.monotonic() + 120,
+                }
+            self.remember(self.sessions, scope, session)
+            return selected
+
+    async def chat_logged(self, event, action, summary, ids, change):
+        """Run a chat edit and record it so 撤销修改 or the web page can undo it."""
+        before = await asyncio.to_thread(self.library.snapshot, ids)
+        result = await asyncio.to_thread(change)
+        after = await asyncio.to_thread(self.library.snapshot, ids)
+        await asyncio.to_thread(
+            self.library.log_operation,
+            "chat:" + self.owner(event),
+            action,
+            summary,
+            before,
+            after,
+        )
+        return result
+
+    async def undo_last(self, event):
+        actor = "chat:" + self.owner(event)
+        admin = self.admin(event)
+        operations = await asyncio.to_thread(self.library.operations, 50)
+        target = next(
+            (
+                o
+                for o in operations
+                if not o["undone"] and (admin or o["actor"] == actor)
+            ),
+            None,
+        )
+        if target is None:
+            raise ValueError("没有可以撤销的修改")
+        async with self.mutation:
+            result = await asyncio.to_thread(self.library.undo, target["id"])
+        message = f"已撤销：{result['summary']}"
+        if result["conflicts"]:
+            message += f"（{result['conflicts']} 张之后又被改过，保留了现状）"
+        await self.say(event, message)
 
     async def editable(self, event, image_id, include_deleted=False):
         item = await self.fetch(event, image_id, include_deleted)
@@ -567,7 +1096,7 @@ class MemeHarborPlugin(Star, GalleryAPI):
             if not args:
                 raise ValueError("用法：发图 12，编号在搜图预览图里")
             item = await self.fetch(event, args)
-            await self.send_images(event, [item], explicit=True)
+            await self.send_images(event, [item], explicit=True, kind="id")
         elif command == "随机图":
             parts = args.split()
             count = int(parts.pop()) if len(parts) > 1 and parts[-1].isdigit() else 1
@@ -575,9 +1104,20 @@ class MemeHarborPlugin(Star, GalleryAPI):
             if count < 1 or count > maximum:
                 raise ValueError(f"一次可以发 1～{maximum} 张")
             query = " ".join(parts)
-            items = await self.search(query, event=event)
+            items = await self.search(
+                query, event=event, partial=bool(self.config.get("partial_match", True))
+            )
             await self.log_search(event, query, len(items), "random")
-            await self.send_images(event, items, count)
+            if not items and query:
+                hint = await asyncio.to_thread(
+                    self.no_result_hint, query, query.split(), event
+                )
+                raise ValueError(hint)
+            await self.send_images(event, items, count, kind="random", query=query)
+        elif command in {"回一张", "回图", "接一张", "斗一张", "以图回图"}:
+            await self.reply_with_image(event, explicit=True)
+        elif command in {"撤销修改", "撤销"}:
+            await self.undo_last(event)
         elif command == "图片详情":
             if not args:
                 raise ValueError("用法：图片详情 12")
@@ -632,11 +1172,19 @@ class MemeHarborPlugin(Star, GalleryAPI):
                 raise ValueError(f"用法：{command} 12 标签1 标签2")
             async with self.mutation:
                 item = await self.editable(event, image_id)
-                await asyncio.to_thread(
-                    self.library.update_tags,
+                words = tags_from(labels)
+                await self.chat_logged(
+                    event,
+                    "tags",
+                    f"{'给' if command == '标签添加' else '从'}图片 #{item['id']}"
+                    f"{'添加' if command == '标签添加' else '移除'}"
+                    + "".join(f"「{w}」" for w in words),
                     [item["id"]],
-                    "add" if command == "标签添加" else "remove",
-                    tags_from(labels),
+                    lambda: self.library.update_tags(
+                        [item["id"]],
+                        "add" if command == "标签添加" else "remove",
+                        words,
+                    ),
                 )
                 item = await asyncio.to_thread(self.library.get, item["id"])
             await self.say(
@@ -649,7 +1197,14 @@ class MemeHarborPlugin(Star, GalleryAPI):
             if len(parts) != 2:
                 raise ValueError(f"用法：{command} 旧标签 新标签")
             async with self.mutation:
-                count = await asyncio.to_thread(self.library.rename_tag, *parts)
+                affected = await asyncio.to_thread(self.library.tagged_ids, [parts[0]])
+                count = await self.chat_logged(
+                    event,
+                    "rename",
+                    f"把「{parts[0]}」改为「{parts[1]}」",
+                    affected,
+                    lambda: self.library.rename_tag(*parts),
+                )
             await self.say(
                 event, f"已把 {count} 张图片的「{parts[0]}」改为「{parts[1]}」"
             )
@@ -660,15 +1215,20 @@ class MemeHarborPlugin(Star, GalleryAPI):
                 )
             async with self.mutation:
                 item = await self.editable(event, args, include_deleted=True)
-                await asyncio.to_thread(
-                    self.library.recycle, [item["id"]], command == "恢复图片"
+                restore = command == "恢复图片"
+                await self.chat_logged(
+                    event,
+                    "restore" if restore else "delete",
+                    f"{'恢复' if restore else '删除'}图片 #{item['id']}",
+                    [item["id"]],
+                    lambda: self.library.recycle([item["id"]], restore),
                 )
             if command == "恢复图片":
                 await self.say(event, f"图片 {item['id']} 已恢复")
             else:
                 await self.say(
                     event,
-                    f"图片 {item['id']} 已移入回收站，发送「恢复图片 {item['id']}」可以撤回",
+                    f"图片 {item['id']} 已移入回收站，发送「恢复图片 {item['id']}」或「撤销修改」可以撤回",
                 )
         elif command == "识图":
             if not args:

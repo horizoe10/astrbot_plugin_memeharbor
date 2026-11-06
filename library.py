@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import random
 import re
 import sqlite3
 import stat
@@ -29,7 +30,9 @@ EXTENSIONS = {
 }
 MAX_PIXELS = 40_000_000
 INBOX_TAGS = ("待整理", "临时")
-SORTS = ("new", "old", "sent", "inbox")
+SORTS = ("new", "old", "sent", "inbox", "best")
+# Fields an undoable operation may change; undo restores only what it changed.
+SNAPSHOT_FIELDS = ("tags", "deleted", "caption", "ocr", "sent", "review")
 # 256-bit dHash per frame. Calibrated on a real sticker library: re-encoded
 # copies stay within about 16 bits, while different expressions of one character
 # on the same background differ by 22+ bits, so 16 keeps such variants apart.
@@ -224,6 +227,11 @@ class Library:
                     connection.execute(
                         f"ALTER TABLE images ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
                     )
+            if "review" not in columns:
+                # 1 = submitted by a member and waiting for an admin (review mode).
+                connection.execute(
+                    "ALTER TABLE images ADD COLUMN review INTEGER NOT NULL DEFAULT 0"
+                )
             version = connection.execute(
                 "SELECT value FROM meta WHERE key='phash_version'"
             ).fetchone()
@@ -245,7 +253,19 @@ class Library:
                     kind TEXT NOT NULL DEFAULT 'search'
                 );
                 CREATE INDEX IF NOT EXISTS search_at ON search_log(at);
+                CREATE TABLE IF NOT EXISTS send_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    at REAL NOT NULL,
+                    scope TEXT NOT NULL DEFAULT '',
+                    image_id INTEGER NOT NULL,
+                    digest TEXT NOT NULL DEFAULT '',
+                    kind TEXT NOT NULL DEFAULT '',
+                    query TEXT NOT NULL DEFAULT '',
+                    feedback INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS send_scope_at ON send_log(scope, at);
             """)
+        self._fold_alias_tags()
 
     @contextmanager
     def connect(self):
@@ -260,6 +280,33 @@ class Library:
     def invalidate(self):
         with self._lock:
             self._cache = None
+
+    def canonical(self, labels):
+        """Store the main tag when someone writes an alias, e.g. 喵 -> 猫."""
+        aliases = self.aliases()
+        if not aliases:
+            return list(labels)
+        return list(dict.fromkeys(aliases.get(t.casefold(), t) for t in labels))
+
+    def _fold_alias_tags(self):
+        """Repair tags saved under an alias before collecting resolved aliases."""
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            aliases = {
+                row[0]: row[1]
+                for row in connection.execute("SELECT alias, tag FROM aliases")
+            }
+            if not aliases:
+                return
+            for row in connection.execute("SELECT id, tags FROM images").fetchall():
+                tags = json.loads(row["tags"])
+                fixed = list(dict.fromkeys(aliases.get(t.casefold(), t) for t in tags))
+                if fixed != tags:
+                    connection.execute(
+                        "UPDATE images SET tags=? WHERE id=?",
+                        (json.dumps(fixed, ensure_ascii=False), row["id"]),
+                    )
+        self.invalidate()
 
     def _signature(self):
         try:
@@ -304,7 +351,7 @@ class Library:
         item["tags"] = json.loads(item["tags"])
         item["scopes"] = json.loads(item.get("scopes") or "[]")
         item.pop("phash_checked", None)
-        for key in ("width", "height", "frames"):
+        for key in ("width", "height", "frames", "review"):
             item.setdefault(key, 0)
         return item
 
@@ -332,9 +379,11 @@ class Library:
             raise ValueError("这张图片在回收站中，请先恢复")
         return item
 
-    def add(self, data, tags, owner="", origin="", restore_duplicate=True):
+    def add(
+        self, data, tags, owner="", origin="", restore_duplicate=True, review=False
+    ):
         extension = inspect_image(data, self.max_bytes)
-        labels = tags_from(tags)
+        labels = self.canonical(tags_from(tags))
         digest = hashlib.sha256(data).hexdigest()
         try:
             facts = analyze(data)
@@ -342,13 +391,30 @@ class Library:
             facts = {"phash": "", "width": 0, "height": 0, "frames": 0}
         try:
             return self._add(
-                data, extension, labels, digest, facts, owner, origin, restore_duplicate
+                data,
+                extension,
+                labels,
+                digest,
+                facts,
+                owner,
+                origin,
+                restore_duplicate,
+                review,
             )
         finally:
             self.invalidate()
 
     def _add(
-        self, data, extension, labels, digest, facts, owner, origin, restore_duplicate
+        self,
+        data,
+        extension,
+        labels,
+        digest,
+        facts,
+        owner,
+        origin,
+        restore_duplicate,
+        review=False,
     ):
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -357,7 +423,10 @@ class Library:
                 (digest,),
             ).fetchone()
             duplicate = row is not None
-            if duplicate:
+            if duplicate and review:
+                # A submission waiting for review must not change a known image.
+                image_id = row["id"]
+            elif duplicate:
                 item = self.record(row)
                 labels = list(dict.fromkeys(item["tags"] + labels))
                 if len(labels) > 24:
@@ -388,7 +457,7 @@ class Library:
                 finally:
                     temporary.unlink(missing_ok=True)
                 cursor = connection.execute(
-                    "INSERT INTO images(filename,digest,tags,created,owner,origin,phash,phash_checked,width,height,frames) VALUES(?,?,?,?,?,?,?,1,?,?,?)",
+                    "INSERT INTO images(filename,digest,tags,created,owner,origin,phash,phash_checked,width,height,frames,review) VALUES(?,?,?,?,?,?,?,1,?,?,?,?)",
                     (
                         filename,
                         digest,
@@ -400,80 +469,125 @@ class Library:
                         facts["width"],
                         facts["height"],
                         facts["frames"],
+                        int(bool(review)),
                     ),
                 )
                 image_id = cursor.lastrowid
         return self.get(image_id, include_deleted=True), duplicate
 
     def search(
-        self, query="", deleted=False, case_sensitive=False, sort="new", visible=None
+        self,
+        query="",
+        deleted=False,
+        case_sensitive=False,
+        sort="new",
+        visible=None,
+        partial=False,
+        review=False,
+        boost=None,
     ):
+        """Find images; the query syntax is shared by chat and the web page.
+
+        Words in a group must all match, "-word" excludes, "|" separates
+        alternatives and "#12" picks an id. A word matches a tag exactly, an
+        alias, part of a tag (when partial is on) or the description/OCR text.
+        "best" sorts by how well an image matched, then by boost (how often a
+        group used it), then newest first.
+        """
         groups = [
-            re.split(r"[\s,，、;；]+", group.strip()) for group in query.split("|")
+            [t for t in re.split(r"[\s,，、;；]+", group.strip()) if t]
+            for group in query.split("|")
         ]
         entries = self._entries()
         aliases = self.aliases()
+        fold = (lambda x: x) if case_sensitive else str.casefold
 
-        def matches(entry, term):
+        def score(entry, term, allow_partial):
             item, folded_tags, folded_text = entry
             if term.startswith("#"):
-                return str(item["id"]) == term[1:]
+                return 3 if str(item["id"]) == term[1:] else 0
+            key = fold(term)
+            tags = item["tags"] if case_sensitive else folded_tags
+            if key in tags:
+                return 3
             target = aliases.get(term.casefold())
-            if case_sensitive:
-                return (
-                    term in item["tags"]
-                    or term in (item["caption"] + " " + item["ocr"])
-                    or (target is not None and target in item["tags"])
-                )
-            term = term.casefold()
-            return (
-                term in folded_tags
-                or term in folded_text
-                or (target is not None and target.casefold() in folded_tags)
+            if target is not None and fold(target) in tags:
+                return 2.5
+            if allow_partial and any(key in t for t in tags):
+                return 1
+            text = (
+                item["caption"] + " " + item["ocr"] if case_sensitive else folded_text
             )
+            return 0.5 if key and key in text else 0
 
-        result = []
+        result, scores = [], {}
         for entry in entries:
             item = entry[0]
             if bool(item["deleted"]) != deleted:
                 continue
+            if not deleted and bool(item.get("review")) != review:
+                continue
             if visible is not None and not visible(item):
                 continue
-            if any(
-                all(
-                    not matches(entry, t[1:])
-                    if t.startswith("-")
-                    else matches(entry, t)
-                    for t in terms
-                    if t
-                )
-                for terms in groups
-            ):
-                result.append(self.copy(item))
+            best = None
+            for terms in groups:
+                total, ok = 0, True
+                for term in terms:
+                    if term.startswith("-"):
+                        if term[1:] and score(entry, term[1:], False):
+                            ok = False
+                            break
+                        continue
+                    value = score(entry, term, partial)
+                    if not value:
+                        ok = False
+                        break
+                    total += value
+                if ok and (best is None or total > best):
+                    best = total
+            if best is not None:
+                copy = self.copy(item)
+                scores[copy["id"]] = best
+                result.append(copy)
         if sort == "old":
             result.reverse()
         elif sort == "sent":
             result.sort(key=lambda item: (-item["sent"], -item["id"]))
         elif sort == "inbox":
             result.sort(key=lambda item: (not in_inbox(item), -item["id"]))
+        elif sort == "best":
+            boost = boost or {}
+            result.sort(
+                key=lambda item: (
+                    -scores[item["id"]],
+                    -boost.get(item["id"], 0),
+                    -item["id"],
+                )
+            )
         return result
 
     def tag_counts(self, visible=None):
         counts = {}
         for item, _, _ in self._entries():
-            if item["deleted"] or (visible is not None and not visible(item)):
+            if (
+                item["deleted"]
+                or item.get("review")
+                or (visible is not None and not visible(item))
+            ):
                 continue
             for tag in item["tags"]:
                 counts[tag] = counts.get(tag, 0) + 1
         return dict(sorted(counts.items(), key=lambda entry: (-entry[1], entry[0])))
 
     def stats(self, visible=None):
-        active, deleted = [], 0
+        active, deleted, review = [], 0, 0
         for item, _, _ in self._entries():
             if visible is not None and not visible(item):
                 continue
             if item["deleted"]:
                 deleted += 1
+            elif item.get("review"):
+                review += 1
             else:
                 active.append(item)
         counts = self.tag_counts(visible)
@@ -481,7 +595,9 @@ class Library:
         return {
             "total": len(active),
             "deleted": deleted,
+            "review": review,
             "inbox": sum(in_inbox(item) for item in active),
+            "auto": sum(in_inbox(item) and item["owner"] == "auto" for item in active),
             "tags": len(counts),
             "sent": sum(item["sent"] for item in active),
             "added_week": sum(item["created"] >= week for item in active),
@@ -505,6 +621,8 @@ class Library:
 
     def _update_tags(self, ids, action, labels):
         labels = tags_from(labels)
+        if action != "remove":
+            labels = self.canonical(labels)
         if action not in {"add", "remove", "replace"}:
             raise ValueError("不支持的标签操作")
         with self.connect() as connection:
@@ -535,7 +653,7 @@ class Library:
             self.invalidate()
 
     def _rename_tag(self, old, new):
-        labels = tags_from(new)
+        labels = self.canonical(tags_from(new))
         if len(labels) != 1:
             raise ValueError("新标签必须是一个词")
         new = labels[0]
@@ -699,7 +817,9 @@ class Library:
         items = [
             item
             for item, _, _ in self._entries()
-            if not item["deleted"] and len(item["phash"]) == HASH_BITS // 2
+            if not item["deleted"]
+            and not item.get("review")
+            and len(item["phash"]) == HASH_BITS // 2
         ]
         values = {item["id"]: hash_parts(item["phash"]) for item in items}
         with self.connect() as connection:
@@ -950,7 +1070,7 @@ class Library:
             aliases.setdefault(tag, []).append(alias)
         tags = {}
         for item, _, _ in self._entries():
-            if item["deleted"]:
+            if item["deleted"] or item.get("review"):
                 continue
             for tag in item["tags"]:
                 info = tags.setdefault(
@@ -1037,7 +1157,7 @@ class Library:
         overview = [t for t in self.tag_overview(days) if not t["inbox"]]
         members = {}
         for item, _, _ in self._entries():
-            if not item["deleted"]:
+            if not item["deleted"] and not item.get("review"):
                 for tag in item["tags"]:
                     members.setdefault(tag, set()).add(item["id"])
         pairs, seen = [], set()
@@ -1097,7 +1217,7 @@ class Library:
 
     def _finish(self, ids, labels):
         """Add tags and take images out of the inbox in one undoable step."""
-        labels = [t for t in tags_from(labels) if t not in INBOX_TAGS]
+        labels = [t for t in self.canonical(tags_from(labels)) if t not in INBOX_TAGS]
         if not labels:
             raise ValueError("请先输入标签")
         changed = 0
@@ -1219,6 +1339,292 @@ class Library:
                 counts[item["origin"]] = counts.get(item["origin"], 0) + 1
         return sorted(counts.items(), key=lambda entry: -entry[1])
 
+    # ---------- chat helpers: suggestions, look-alikes, sending ----------
+
+    def suggest(self, term, visible=None, limit=5):
+        """Existing tags close to a word that found nothing: contained or a typo away."""
+        word = term.strip().lstrip("-").casefold()
+        if not word or word.startswith("#"):
+            return []
+        counts = {
+            t: n for t, n in self.tag_counts(visible).items() if t not in INBOX_TAGS
+        }
+        ranked = []
+        for tag, count in counts.items():
+            key = tag.casefold()
+            if key == word:
+                continue
+            if word in key or (len(key) >= 2 and key in word):
+                ranked.append((0, -count, tag))
+                continue
+            allowed = 1 if len(word) <= 3 else 2
+            if abs(len(key) - len(word)) <= allowed:
+                distance = _edit_distance(word, key)
+                if distance <= allowed:
+                    ranked.append((distance, -count, tag))
+        for alias, tag in self.aliases().items():
+            if tag in counts and (word in alias or alias in word):
+                ranked.append((0, -counts[tag], tag))
+        seen, result = set(), []
+        for _, negative, tag in sorted(ranked):
+            if tag not in seen:
+                seen.add(tag)
+                result.append((tag, -negative))
+        return result[:limit]
+
+    def nearest(self, phash, visible=None, limit=5, exclude=()):
+        """Active images closest to a perceptual hash, as (distance, item)."""
+        if len(phash or "") != HASH_BITS // 2:
+            return []
+        mine = hash_parts(phash)
+        found = []
+        for item, _, _ in self._entries():
+            if (
+                item["deleted"]
+                or item.get("review")
+                or item["id"] in exclude
+                or len(item["phash"]) != HASH_BITS // 2
+                or (visible is not None and not visible(item))
+            ):
+                continue
+            found.append((hash_distance(mine, hash_parts(item["phash"])), item))
+        found.sort(key=lambda entry: (entry[0], -entry[1]["id"]))
+        return [(d, self.copy(i)) for d, i in found[:limit]]
+
+    def image_reply(self, phash, visible=None, digest=""):
+        """Answer a picture with another one: guess its tags from look-alikes.
+
+        Returns (candidates, tags). The look-alikes themselves are skipped, so
+        the group never gets its own picture back.
+        """
+        near = self.nearest(phash, visible, limit=8)
+        votes = {}
+        for distance, item in near:
+            if distance > 70:
+                break
+            weight = 3 if distance <= SIMILAR_DISTANCE else (70 - distance) / 54
+            for tag in item["tags"]:
+                if tag not in INBOX_TAGS:
+                    votes[tag] = votes.get(tag, 0) + weight
+        if not votes:
+            return [], []
+        ranked = sorted(votes, key=lambda t: -votes[t])
+        # A second tag only counts when look-alikes agree on it nearly as much.
+        top = [t for t in ranked[:2] if votes[t] >= votes[ranked[0]] * 0.6]
+        same = {item["id"] for distance, item in near if distance <= SIMILAR_DISTANCE}
+        pool = []
+        for item, _, _ in self._entries():
+            if (
+                item["deleted"]
+                or item.get("review")
+                or item["id"] in same
+                or (digest and item["digest"] == digest)
+                or (visible is not None and not visible(item))
+            ):
+                continue
+            overlap = len(set(top) & set(item["tags"]))
+            if overlap:
+                pool.append((overlap, item))
+        best = max((overlap for overlap, _ in pool), default=0)
+        return [self.copy(i) for overlap, i in pool if overlap == best], top
+
+    def record_send(self, scope, item, kind="", query=""):
+        with self.insights_db() as connection:
+            connection.execute(
+                "INSERT INTO send_log(at, scope, image_id, digest, kind, query) VALUES(?,?,?,?,?,?)",
+                (
+                    time.time(),
+                    scope,
+                    int(item["id"]),
+                    item["digest"],
+                    kind,
+                    query[:200],
+                ),
+            )
+            connection.execute(
+                "DELETE FROM send_log WHERE id <= (SELECT MAX(id) FROM send_log) - 50000"
+            )
+
+    def feedback(self, scope, image_ids, value):
+        """Mark the latest send of these images in a group: -1 swapped away, +1 liked."""
+        with self.insights_db() as connection:
+            for image_id in image_ids:
+                connection.execute(
+                    "UPDATE send_log SET feedback=? WHERE id=(SELECT MAX(id) FROM send_log WHERE scope=? AND image_id=?)",
+                    (int(value), scope, int(image_id)),
+                )
+
+    def sent_recently(self, scope, hours):
+        """Digest -> last send time in this group within the window."""
+        since = time.time() - max(0, hours) * 3600
+        with self.insights_db() as connection:
+            return {
+                digest: at
+                for digest, at in connection.execute(
+                    "SELECT digest, MAX(at) FROM send_log WHERE scope=? AND at>=? GROUP BY digest",
+                    (scope, since),
+                )
+            }
+
+    def send_stats(self, scope=None, days=30):
+        """Image id -> {sends, swaps, likes} over recent days, per group or overall."""
+        since = time.time() - days * 86400
+        sql = "SELECT image_id, COUNT(*), SUM(feedback<0), SUM(feedback>0) FROM send_log WHERE at>=?"
+        params = [since]
+        if scope is not None:
+            sql += " AND scope=?"
+            params.append(scope)
+        with self.insights_db() as connection:
+            rows = connection.execute(sql + " GROUP BY image_id", params).fetchall()
+        return {
+            r[0]: {"sends": r[1], "swaps": r[2] or 0, "likes": r[3] or 0} for r in rows
+        }
+
+    def pick(self, items, count, scope, hours=6, rng=random):
+        """Choose images for a group: skip recent ones, prefer the less used.
+
+        Images sent here within the window are used only when nothing else is
+        left (oldest first). Among the rest, each image's chance falls with how
+        often this group already got it and how often it was swapped away, and
+        rises a little for new and liked images.
+        """
+        unique = list({item["digest"]: item for item in items}.values())
+        if not unique:
+            return []
+        recent = self.sent_recently(scope, hours) if hours else {}
+        stats = self.send_stats(scope)
+        fresh = [i for i in unique if i["digest"] not in recent]
+        older = sorted(
+            (i for i in unique if i["digest"] in recent),
+            key=lambda i: recent[i["digest"]],
+        )
+        week = time.time() - 7 * 86400
+
+        def weight(item):
+            info = stats.get(item["id"], {})
+            value = 1 / (1 + info.get("sends", 0)) ** 0.7
+            value *= 0.6 ** info.get("swaps", 0) * 1.3 ** min(3, info.get("likes", 0))
+            return value * (1.5 if item["created"] >= week else 1)
+
+        chosen = []
+        pool = list(fresh)
+        while pool and len(chosen) < count:
+            weights = [weight(i) for i in pool]
+            index = rng.choices(range(len(pool)), weights)[0]
+            chosen.append(pool.pop(index))
+        return (chosen + older)[:count]
+
+    def top_sent(self, days=30, limit=24):
+        stats = self.send_stats(None, days)
+        ranked = sorted(stats.items(), key=lambda e: (-e[1]["sends"], e[0]))
+        result = []
+        for image_id, info in ranked:
+            try:
+                item = self.get(image_id)
+            except ValueError:
+                continue
+            result.append(dict(self.copy(item), **info))
+            if len(result) >= limit:
+                break
+        return result
+
+    def sendable(self, item, limit):
+        """A file within the platform size limit; larger images get a smaller copy."""
+        path = self.path(item)
+        if not limit or path.stat().st_size <= limit:
+            return path
+        folder = self.root / "send_cache"
+        folder.mkdir(exist_ok=True)
+        with Image.open(path) as source:
+            animated = getattr(source, "n_frames", 1) > 1
+            alpha = source.mode in ("RGBA", "LA", "P") and not animated
+        suffix = ".gif" if animated else (".png" if alpha else ".jpg")
+        target = folder / f"{item['digest']}-{limit}{suffix}"
+        if target.is_file():
+            return target
+        scale = 1.0
+        for _ in range(8):
+            scale *= 0.8
+            buffer = io.BytesIO()
+            with Image.open(path) as source:
+                size = (
+                    max(16, int(source.width * scale)),
+                    max(16, int(source.height * scale)),
+                )
+                if animated:
+                    frames, durations = [], []
+                    for index in range(source.n_frames):
+                        source.seek(index)
+                        frames.append(source.convert("RGBA").resize(size))
+                        durations.append(source.info.get("duration", 80))
+                    frames[0].save(
+                        buffer,
+                        format="GIF",
+                        save_all=True,
+                        append_images=frames[1:],
+                        duration=durations,
+                        loop=source.info.get("loop", 0),
+                        disposal=2,
+                        optimize=True,
+                    )
+                elif alpha:
+                    source.convert("RGBA").resize(size).save(
+                        buffer, format="PNG", optimize=True
+                    )
+                else:
+                    source.convert("RGB").resize(size).save(
+                        buffer, format="JPEG", quality=85
+                    )
+            if buffer.tell() <= limit:
+                temporary = folder / f".{uuid.uuid4().hex}.tmp"
+                temporary.write_bytes(buffer.getvalue())
+                os.replace(temporary, target)
+                cached = sorted(folder.glob("*-*.*"), key=lambda p: p.stat().st_mtime)
+                for old in cached[:-200]:
+                    old.unlink(missing_ok=True)
+                return target
+        return path
+
+    def set_review(self, ids, approve):
+        """Approve submissions, or reject them into the trash (they stay unreviewed)."""
+        try:
+            with self.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                changed = 0
+                for image_id in ids:
+                    if approve:
+                        cursor = connection.execute(
+                            "UPDATE images SET review=0 WHERE id=? AND review=1",
+                            (int(image_id),),
+                        )
+                    else:
+                        cursor = connection.execute(
+                            "UPDATE images SET deleted=? WHERE id=? AND review=1 AND deleted IS NULL",
+                            (time.time(), int(image_id)),
+                        )
+                    changed += cursor.rowcount
+            return changed
+        finally:
+            self.invalidate()
+
+    def backup(self, folder, keep=3):
+        """Write a dated backup into folder and keep only the newest few."""
+        folder.mkdir(parents=True, exist_ok=True)
+        path = self.export()
+        target = folder / time.strftime("memeharbor-backup-%Y%m%d-%H%M%S.zip")
+        os.replace(path, target)
+        backups = sorted(folder.glob("memeharbor-backup-*.zip"))
+        for old in backups[: max(0, len(backups) - max(1, keep))]:
+            old.unlink(missing_ok=True)
+        return target
+
+    @staticmethod
+    def last_backup(folder):
+        backups = (
+            sorted(folder.glob("memeharbor-backup-*.zip")) if folder.is_dir() else []
+        )
+        return backups[-1].stat().st_mtime if backups else None
+
     # ---------- undo log for web edits ----------
 
     def snapshot(self, ids):
@@ -1228,16 +1634,12 @@ class Library:
             for start in range(0, len(ids), 500):
                 chunk = ids[start : start + 500]
                 for row in connection.execute(
-                    f"SELECT id, tags, deleted, caption, ocr, sent FROM images WHERE id IN ({','.join('?' * len(chunk))})",
+                    f"SELECT id, {', '.join(SNAPSHOT_FIELDS)} FROM images WHERE id IN ({','.join('?' * len(chunk))})",
                     chunk,
                 ):
-                    result[str(row["id"])] = {
-                        "tags": json.loads(row["tags"]),
-                        "deleted": row["deleted"],
-                        "caption": row["caption"],
-                        "ocr": row["ocr"],
-                        "sent": row["sent"],
-                    }
+                    state = {field: row[field] for field in SNAPSHOT_FIELDS}
+                    state["tags"] = json.loads(row["tags"])
+                    result[str(row["id"])] = state
         return result
 
     def tagged_ids(self, tags):
@@ -1305,33 +1707,38 @@ class Library:
                 restored = conflicts = 0
                 for key, state in after.items():
                     current = connection.execute(
-                        "SELECT tags, deleted, caption, ocr, sent FROM images WHERE id=?",
+                        f"SELECT {', '.join(SNAPSHOT_FIELDS)} FROM images WHERE id=?",
                         (int(key),),
                     ).fetchone()
                     if current is None:
                         conflicts += 1
                         continue
-                    now = {
-                        "tags": json.loads(current["tags"]),
-                        "deleted": current["deleted"],
-                        "caption": current["caption"],
-                        "ocr": current["ocr"],
-                        "sent": current["sent"],
-                    }
-                    if now != state:
+                    old = before[key]
+                    # Only compare and restore what this operation changed, so a
+                    # later send (which bumps "sent") does not block undoing tags.
+                    fields = [
+                        f
+                        for f in SNAPSHOT_FIELDS
+                        if f in state and old.get(f) != state[f]
+                    ]
+                    if not fields:
+                        restored += 1
+                        continue
+                    now = {f: current[f] for f in fields}
+                    if "tags" in now:
+                        now["tags"] = json.loads(now["tags"])
+                    if any(now[f] != state[f] for f in fields):
                         conflicts += 1
                         continue
-                    old = before[key]
+                    values = [
+                        json.dumps(old[f], ensure_ascii=False)
+                        if f == "tags"
+                        else old[f]
+                        for f in fields
+                    ]
                     connection.execute(
-                        "UPDATE images SET tags=?, deleted=?, caption=?, ocr=?, sent=? WHERE id=?",
-                        (
-                            json.dumps(old["tags"], ensure_ascii=False),
-                            old["deleted"],
-                            old["caption"],
-                            old["ocr"],
-                            old["sent"],
-                            int(key),
-                        ),
+                        f"UPDATE images SET {', '.join(f + '=?' for f in fields)} WHERE id=?",
+                        (*values, int(key)),
                     )
                     restored += 1
                 connection.execute(
@@ -1541,7 +1948,7 @@ def render_preview(library, items, query, page, pages, total):
     )
     draw.text(
         (26, 62),
-        f"第 {page}/{pages} 页 · 共 {total} 张 · 发送「发图 编号」取原图",
+        f"第 {page}/{pages} 页 · 共 {total} 张 · 回复序号取原图，例如「1」或「发 1 3」",
         font=font(19),
         fill="#596778",
     )
@@ -1555,7 +1962,16 @@ def render_preview(library, items, query, page, pages, total):
             draw.text(
                 (x + 30, y + 70), "原图缺失或无法预览", font=font(18), fill="#b35454"
             )
-        draw.text((x + 12, y + 210), f"#{item['id']}", font=font(21), fill="#284fbe")
+        # Big position number for "reply 3"; the permanent id stays readable.
+        draw.ellipse(
+            (x + 14, y + 14, x + 58, y + 58), fill="#2f6bea", outline="white", width=3
+        )
+        number = str(index + 1)
+        width = draw.textlength(number, font=font(26))
+        draw.text((x + 36 - width / 2, y + 18), number, font=font(26), fill="white")
+        draw.text(
+            (x + 12, y + 212), f"编号 {item['id']}", font=font(18), fill="#8a96a8"
+        )
         label = " · ".join(item["tags"]) or "无标签"
         while draw.textlength(label, font=font(17)) > 273:
             label = label[:-2] + "…"

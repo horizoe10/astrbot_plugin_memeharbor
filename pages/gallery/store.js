@@ -4,7 +4,7 @@ import { useEffect, useState } from './vendor/htm-preact.js';
 const listeners = new Set();
 export const state = {
   route: { page: 'home', params: new URLSearchParams() },
-  counts: { all: 0, inbox: 0, trash: 0 },
+  counts: { all: 0, inbox: 0, trash: 0, review: 0 },
   tags: [], aliases: {}, inboxTags: ['待整理', '临时'],
   aiEnabled: false, scopeMode: 'shared',
   analysis: 0, similar: null,

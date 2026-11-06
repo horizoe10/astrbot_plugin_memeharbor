@@ -74,6 +74,12 @@ export function Insights() {
         ${data?.daily.length ? html`<h3>每天搜图次数</h3><div class="spark">${data.daily.map((d) => html`<span key=${d.day} title=${d.day + '：' + d.count + ' 次'}><i style=${'height:' + Math.max(4, (d.count / dayMax) * 100) + '%'}></i><small>${d.day.slice(3)}</small></span>`)}</div>` : null}
       </section>
     </div>
+    ${data?.top_sent?.length ? html`<section class="card">
+      <h2>群里最常发的图</h2>
+      <p class="muted">最近 30 天发得最多的图。被「换一张」换掉得多，说明大家不太想要它；被夸「好图」的会更常出现。</p>
+      <div class="mini-grid">${data.top_sent.map((i) => html`<button key=${i.id} class="mini" onClick=${() => set({ detail: i.id, detailList: data.top_sent.map((x) => x.id) })}>
+        <${Thumb} id=${i.id} gif=${i.gif} /><small>发出 ${i.sends} 次${i.swaps ? ' · 被换 ' + i.swaps : ''}${i.likes ? ' · 好图 ' + i.likes : ''}</small></button>`)}</div>
+    </section>` : null}
     <${Preview} />
   </div>`;
 }

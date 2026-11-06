@@ -22,13 +22,16 @@ export function Home() {
   const s = data.stats;
   const misses = data.misses;
   const similar = data.similar_groups;
+  const backup = data.backup_days ? (data.last_backup ? '上次自动备份 ' + fmtAgo(data.last_backup) : '还没有自动备份') : '自动备份已关闭';
   return html`<div class="page home">
     <header class="page-head">
-      <div><h1>今天的表情港湾</h1><p class="muted">图库共 ${s.total} 张 · ${s.tags} 个标签 · 近 7 天新增 ${s.added_week} 张 · 累计发出 ${s.sent} 次</p></div>
+      <div><h1>今天的表情港湾</h1><p class="muted">图库共 ${s.total} 张 · ${s.tags} 个标签 · 近 7 天新增 ${s.added_week} 张 · 累计发出 ${s.sent} 次 · ${backup}</p></div>
     </header>
     <section class="tasks">
+      ${s.review ? html`<${Task} icon="check" title="待审核投稿" value=${s.review} unit=" 张" tone="warn"
+        hint="群友收集的图，通过后群里才能搜到" action="去审核" onClick=${() => go('library', { view: 'review' })} />` : null}
       <${Task} icon="triage" title="待整理" value=${s.inbox} unit=" 张" tone=${s.inbox ? 'warn' : 'done'}
-        hint=${s.inbox ? '打上标签后，群里才能搜到它们' : '全部整理好了'} action=${s.inbox ? '开始整理' : '去图库'} onClick=${() => go(s.inbox ? 'triage' : 'library')} />
+        hint=${s.inbox ? (s.auto ? '其中 ' + s.auto + ' 张是群里流行、自动收进来的' : '打上标签后，群里才能搜到它们') : '全部整理好了'} action=${s.inbox ? '开始整理' : '去图库'} onClick=${() => go(s.inbox ? 'triage' : 'library')} />
       <${Task} icon="copy" title="相似图片" value=${similar === null ? '…' : similar} unit=${similar === null ? '' : ' 组'}
         hint=${similar === null ? '正在分析旧图片，还剩 ' + (analysis || data.analysis_pending) + ' 张' : similar ? '同一张图被重复收集了' : '没有发现重复的图'} action="去合并" onClick=${() => go('similar')} />
       <${Task} icon="search" title="群里搜不到" value=${misses.reduce((n, m) => n + m.count, 0)} unit=" 次" tone=${misses.length ? 'warn' : ''}
