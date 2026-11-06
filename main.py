@@ -29,7 +29,7 @@ from .media import MediaLoader
 from .web_api import GalleryAPI
 
 PLUGIN = "astrbot_plugin_memeharbor"
-VERSION = "2.0.1"
+VERSION = "2.0.2"
 COMMANDS = {
     "收集",
     "导入记录",
