@@ -7,9 +7,9 @@ import io
 import json
 import os
 import re
-import shutil
 import sqlite3
 import stat
+import threading
 import time
 import uuid
 import zipfile
@@ -27,6 +27,23 @@ EXTENSIONS = {
     "BMP": ".bmp",
 }
 MAX_PIXELS = 40_000_000
+INBOX_TAGS = ("待整理", "临时")
+SORTS = ("new", "old", "sent", "inbox")
+# 256-bit dHash per frame. Calibrated on a real sticker library: re-encoded
+# copies stay within about 16 bits, while different expressions of one character
+# on the same background differ by 22+ bits, so 16 keeps such variants apart.
+HASH_SIDE = 16
+HASH_BITS = HASH_SIDE * HASH_SIDE
+HASH_VERSION = "2"
+SIMILAR_DISTANCE = 16
+# Pigeonhole: two first-frame hashes within 16 bits share one of 17 bands.
+BANDS = tuple(
+    (
+        HASH_BITS * i // (SIMILAR_DISTANCE + 1),
+        HASH_BITS * (i + 1) // (SIMILAR_DISTANCE + 1),
+    )
+    for i in range(SIMILAR_DISTANCE + 1)
+)
 
 
 def tags_from(value: str | list[str]) -> list[str]:
@@ -63,15 +80,69 @@ def inspect_image(data: bytes, limit: int) -> str:
         raise ValueError("无法识别图片内容，链接可能已失效") from exc
 
 
+def _dhash(frame) -> int:
+    gray = frame.convert("L").resize(
+        (HASH_SIDE + 1, HASH_SIDE), Image.Resampling.LANCZOS
+    )
+    pixels = gray.tobytes()
+    bits = 0
+    for row in range(HASH_SIDE):
+        offset = row * (HASH_SIDE + 1)
+        for column in range(HASH_SIDE):
+            bits = (bits << 1) | (pixels[offset + column] > pixels[offset + column + 1])
+    return bits
+
+
+def perceptual_hash(source) -> str:
+    """First-frame and middle-frame dHash as hex, or '' for flat images.
+
+    Animated images compare two frames, so different GIFs that merely start from
+    the same still are not treated as copies.
+    """
+    with Image.open(
+        io.BytesIO(source) if isinstance(source, bytes) else source
+    ) as image:
+        if image.width * image.height > MAX_PIXELS:
+            raise ValueError("图片像素过大")
+        frames = getattr(image, "n_frames", 1)
+        image.seek(0)
+        first = _dhash(ImageOps.exif_transpose(image))
+        if frames > 1:
+            image.seek(frames // 2)
+            middle = _dhash(image)
+        else:
+            middle = first
+    # Flat images carry no structure and would all look alike.
+    if first.bit_count() < 4 or first.bit_count() > HASH_BITS - 4:
+        return ""
+    width = HASH_BITS // 4
+    return f"{first:0{width}x}{middle:0{width}x}"
+
+
+def hash_parts(value):
+    width = HASH_BITS // 4
+    return int(value[:width], 16), int(value[width : width * 2], 16)
+
+
+def hash_distance(a, b) -> int:
+    return max((a[0] ^ b[0]).bit_count(), (a[1] ^ b[1]).bit_count())
+
+
+def in_inbox(item) -> bool:
+    return not item["tags"] or any(tag in INBOX_TAGS for tag in item["tags"])
+
+
 class Library:
     def __init__(self, root: Path, max_bytes: int = 15 * 1048576):
         self.root = root
         self.resources = root / "resource"
         self.cache = root / "preview_cache"
+        self.thumbs = root / "thumb_cache"
         self.db = root / "library_v2.sqlite3"
         self.max_bytes = max_bytes
-        self.migration_warnings = []
-        for path in (root, self.resources, self.cache):
+        self._lock = threading.Lock()
+        self._cache = None
+        for path in (root, self.resources, self.cache, self.thumbs):
             path.mkdir(parents=True, exist_ok=True)
         with self.connect() as connection:
             connection.executescript("""
@@ -90,8 +161,38 @@ class Library:
                 );
                 CREATE INDEX IF NOT EXISTS image_digest ON images(digest);
                 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+                CREATE TABLE IF NOT EXISTS similar_dismissed (
+                    a INTEGER NOT NULL,
+                    b INTEGER NOT NULL,
+                    PRIMARY KEY (a, b)
+                );
             """)
-        self.migrate()
+            columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(images)")
+            }
+            if "phash" not in columns:
+                connection.execute(
+                    "ALTER TABLE images ADD COLUMN phash TEXT NOT NULL DEFAULT ''"
+                )
+            if "phash_checked" not in columns:
+                connection.execute(
+                    "ALTER TABLE images ADD COLUMN phash_checked INTEGER NOT NULL DEFAULT 0"
+                )
+            if "scopes" not in columns:
+                # Extra chats that collected the same image (per-group library mode).
+                connection.execute(
+                    "ALTER TABLE images ADD COLUMN scopes TEXT NOT NULL DEFAULT '[]'"
+                )
+            version = connection.execute(
+                "SELECT value FROM meta WHERE key='phash_version'"
+            ).fetchone()
+            if not version or version[0] != HASH_VERSION:
+                # A new hash algorithm invalidates stored hashes; recompute lazily.
+                connection.execute("UPDATE images SET phash='', phash_checked=0")
+                connection.execute(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES('phash_version', ?)",
+                    (HASH_VERSION,),
+                )
 
     @contextmanager
     def connect(self):
@@ -103,57 +204,40 @@ class Library:
         finally:
             connection.close()
 
-    def migrate(self):
+    def invalidate(self):
+        with self._lock:
+            self._cache = None
+
+    def _signature(self):
+        try:
+            info = self.db.stat()
+            return info.st_mtime_ns, info.st_size
+        except OSError:
+            return None
+
+    def _entries(self):
+        """Parsed catalog, rebuilt only after this library or another writer changes it."""
+        signature = self._signature()
+        with self._lock:
+            if self._cache is not None and self._cache[0] == signature:
+                return self._cache[1]
         with self.connect() as connection:
-            if connection.execute("SELECT 1 FROM meta WHERE key='migrated'").fetchone():
-                return
-            legacy = self.root / "image_tags.json"
-            tags = {}
-            if legacy.exists():
-                try:
-                    raw = json.loads(legacy.read_text(encoding="utf-8-sig"))
-                    tags = raw.get("images", raw) if isinstance(raw, dict) else None
-                    if not isinstance(tags, dict):
-                        raise ValueError("Invalid legacy index")
-                except (ValueError, OSError) as exc:
-                    raise ValueError(
-                        "旧 image_tags.json 无法解析，已停止迁移以保护标签；请先修复或恢复备份"
-                    ) from exc
-                backup = self.root / "image_tags.v1-backup.json"
-                if not backup.exists():
-                    shutil.copy2(legacy, backup)
-            for path in sorted(self.resources.iterdir()):
-                if (
-                    not path.is_file()
-                    or path.is_symlink()
-                    or path.suffix.lower() not in {*EXTENSIONS.values(), ".jpeg"}
-                ):
-                    continue
-                try:
-                    if path.stat().st_size > self.max_bytes:
-                        raise ValueError("Image exceeds size limit")
-                    data = path.read_bytes()
-                    inspect_image(data, self.max_bytes)
-                    original_tags = tags.get(path.name) or [path.stem.split("-", 1)[0]]
-                    # Preserve all legacy labels, even ones new commands reserve.
-                    if isinstance(original_tags, str):
-                        original_tags = [original_tags]
-                    if not isinstance(original_tags, list) or not all(
-                        isinstance(t, str) for t in original_tags
-                    ):
-                        raise ValueError("Invalid tags for legacy image")
-                    connection.execute(
-                        "INSERT OR IGNORE INTO images(filename,digest,tags,created) VALUES(?,?,?,?)",
-                        (
-                            path.name,
-                            hashlib.sha256(data).hexdigest(),
-                            json.dumps(original_tags, ensure_ascii=False),
-                            path.stat().st_mtime,
-                        ),
-                    )
-                except (ValueError, OSError) as exc:
-                    self.migration_warnings.append(f"{path.name}: {exc}")
-            connection.execute("INSERT INTO meta(key,value) VALUES('migrated','2')")
+            rows = connection.execute(
+                "SELECT * FROM images ORDER BY id DESC"
+            ).fetchall()
+        entries = []
+        for row in rows:
+            item = self.record(row)
+            entries.append(
+                (
+                    item,
+                    [tag.casefold() for tag in item["tags"]],
+                    (item["caption"] + " " + item["ocr"]).casefold(),
+                )
+            )
+        with self._lock:
+            self._cache = (signature, entries)
+        return entries
 
     @staticmethod
     def record(row):
@@ -161,7 +245,13 @@ class Library:
             raise ValueError("没有找到这个图片编号")
         item = dict(row)
         item["tags"] = json.loads(item["tags"])
+        item["scopes"] = json.loads(item.get("scopes") or "[]")
+        item.pop("phash_checked", None)
         return item
+
+    @staticmethod
+    def copy(item):
+        return dict(item, tags=list(item["tags"]), scopes=list(item["scopes"]))
 
     def path(self, item):
         path = (self.resources / item["filename"]).resolve()
@@ -187,6 +277,20 @@ class Library:
         extension = inspect_image(data, self.max_bytes)
         labels = tags_from(tags)
         digest = hashlib.sha256(data).hexdigest()
+        try:
+            phash = perceptual_hash(data)
+        except (OSError, ValueError):
+            phash = ""
+        try:
+            return self._add(
+                data, extension, labels, digest, phash, owner, origin, restore_duplicate
+            )
+        finally:
+            self.invalidate()
+
+    def _add(
+        self, data, extension, labels, digest, phash, owner, origin, restore_duplicate
+    ):
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -202,10 +306,14 @@ class Library:
                 target = self.resources / item["filename"]
                 if not target.exists():
                     target.write_bytes(data)
+                scopes = item["scopes"]
+                if origin and origin != item["origin"] and origin not in scopes:
+                    scopes = scopes + [origin]
                 connection.execute(
-                    "UPDATE images SET tags=?,deleted=CASE WHEN ? THEN NULL ELSE deleted END WHERE id=?",
+                    "UPDATE images SET tags=?,scopes=?,deleted=CASE WHEN ? THEN NULL ELSE deleted END WHERE id=?",
                     (
                         json.dumps(labels, ensure_ascii=False),
+                        json.dumps(scopes, ensure_ascii=False),
                         restore_duplicate,
                         item["id"],
                     ),
@@ -221,7 +329,7 @@ class Library:
                 finally:
                     temporary.unlink(missing_ok=True)
                 cursor = connection.execute(
-                    "INSERT INTO images(filename,digest,tags,created,owner,origin) VALUES(?,?,?,?,?,?)",
+                    "INSERT INTO images(filename,digest,tags,created,owner,origin,phash,phash_checked) VALUES(?,?,?,?,?,?,?,1)",
                     (
                         filename,
                         digest,
@@ -229,46 +337,102 @@ class Library:
                         time.time(),
                         owner,
                         origin,
+                        phash,
                     ),
                 )
                 image_id = cursor.lastrowid
         return self.get(image_id, include_deleted=True), duplicate
 
-    def search(self, query="", deleted=False, case_sensitive=False):
-        with self.connect() as connection:
-            rows = connection.execute(
-                "SELECT * FROM images WHERE deleted IS "
-                + ("NOT NULL" if deleted else "NULL")
-                + " ORDER BY id DESC"
-            ).fetchall()
+    def search(
+        self, query="", deleted=False, case_sensitive=False, sort="new", visible=None
+    ):
         groups = [
             re.split(r"[\s,，、;；]+", group.strip()) for group in query.split("|")
         ]
-        normalize = (lambda value: value) if case_sensitive else str.casefold
 
-        def matches(item, term):
+        def matches(entry, term):
+            item, folded_tags, folded_text = entry
             if term.startswith("#"):
                 return str(item["id"]) == term[1:]
-            term = normalize(term)
-            return term in [normalize(t) for t in item["tags"]] or term in normalize(
-                item["caption"] + " " + item["ocr"]
-            )
+            if case_sensitive:
+                return term in item["tags"] or term in (
+                    item["caption"] + " " + item["ocr"]
+                )
+            term = term.casefold()
+            return term in folded_tags or term in folded_text
 
         result = []
-        for row in rows:
-            item = self.record(row)
+        for entry in self._entries():
+            item = entry[0]
+            if bool(item["deleted"]) != deleted:
+                continue
+            if visible is not None and not visible(item):
+                continue
             if any(
                 all(
-                    not matches(item, t[1:]) if t.startswith("-") else matches(item, t)
+                    not matches(entry, t[1:])
+                    if t.startswith("-")
+                    else matches(entry, t)
                     for t in terms
                     if t
                 )
                 for terms in groups
             ):
-                result.append(item)
+                result.append(self.copy(item))
+        if sort == "old":
+            result.reverse()
+        elif sort == "sent":
+            result.sort(key=lambda item: (-item["sent"], -item["id"]))
+        elif sort == "inbox":
+            result.sort(key=lambda item: (not in_inbox(item), -item["id"]))
         return result
 
+    def tag_counts(self, visible=None):
+        counts = {}
+        for item, _, _ in self._entries():
+            if item["deleted"] or (visible is not None and not visible(item)):
+                continue
+            for tag in item["tags"]:
+                counts[tag] = counts.get(tag, 0) + 1
+        return dict(sorted(counts.items(), key=lambda entry: (-entry[1], entry[0])))
+
+    def stats(self, visible=None):
+        active, deleted = [], 0
+        for item, _, _ in self._entries():
+            if visible is not None and not visible(item):
+                continue
+            if item["deleted"]:
+                deleted += 1
+            else:
+                active.append(item)
+        counts = self.tag_counts(visible)
+        week = time.time() - 7 * 86400
+        return {
+            "total": len(active),
+            "deleted": deleted,
+            "inbox": sum(in_inbox(item) for item in active),
+            "tags": len(counts),
+            "sent": sum(item["sent"] for item in active),
+            "added_week": sum(item["created"] >= week for item in active),
+            "top_tags": [
+                {"tag": tag, "count": count}
+                for tag, count in list(counts.items())[:12]
+                if tag not in INBOX_TAGS
+            ],
+            "top_sent": [
+                self.copy(item)
+                for item in sorted(active, key=lambda i: (-i["sent"], -i["id"]))[:8]
+                if item["sent"]
+            ],
+        }
+
     def update_tags(self, ids, action, labels):
+        try:
+            return self._update_tags(ids, action, labels)
+        finally:
+            self.invalidate()
+
+    def _update_tags(self, ids, action, labels):
         labels = tags_from(labels)
         if action not in {"add", "remove", "replace"}:
             raise ValueError("不支持的标签操作")
@@ -294,6 +458,12 @@ class Library:
                 )
 
     def rename_tag(self, old, new):
+        try:
+            return self._rename_tag(old, new)
+        finally:
+            self.invalidate()
+
+    def _rename_tag(self, old, new):
         labels = tags_from(new)
         if len(labels) != 1:
             raise ValueError("新标签必须是一个词")
@@ -317,6 +487,12 @@ class Library:
         return changed
 
     def recycle(self, ids, restore=False):
+        try:
+            return self._recycle(ids, restore)
+        finally:
+            self.invalidate()
+
+    def _recycle(self, ids, restore=False):
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             for image_id in ids:
@@ -333,6 +509,12 @@ class Library:
                 )
 
     def annotate(self, image_id, caption, ocr):
+        try:
+            return self._annotate(image_id, caption, ocr)
+        finally:
+            self.invalidate()
+
+    def _annotate(self, image_id, caption, ocr):
         with self.connect() as connection:
             connection.execute(
                 "UPDATE images SET caption=?,ocr=? WHERE id=?",
@@ -340,8 +522,207 @@ class Library:
             )
 
     def mark_sent(self, image_id):
+        try:
+            return self._mark_sent(image_id)
+        finally:
+            self.invalidate()
+
+    def _mark_sent(self, image_id):
         with self.connect() as connection:
             connection.execute("UPDATE images SET sent=sent+1 WHERE id=?", (image_id,))
+
+    def thumbnail_data(self, item, size=320):
+        """Return a cached WebP thumbnail keyed by content digest."""
+        target = self.thumbs / f"{item['digest']}-{size}.webp"
+        if not target.is_file():
+            with Image.open(self.path(item)) as source:
+                if source.width * source.height > MAX_PIXELS:
+                    raise ValueError("图片像素过大")
+                image = ImageOps.exif_transpose(source).convert("RGBA")
+            image.thumbnail((size, size))
+            temporary = self.thumbs / f".{uuid.uuid4().hex}.tmp"
+            try:
+                image.save(temporary, format="WEBP", quality=80, method=4)
+                os.replace(temporary, target)
+            finally:
+                temporary.unlink(missing_ok=True)
+        return target.read_bytes()
+
+    def original_data(self, item, limit=8 * 1048576):
+        """Original bytes for in-page preview (GIFs animate); large files fall back."""
+        path = self.path(item)
+        if path.stat().st_size <= limit:
+            data = path.read_bytes()
+            mime = {
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".png": "image/png",
+                ".gif": "image/gif",
+                ".webp": "image/webp",
+                ".bmp": "image/bmp",
+            }.get(path.suffix.lower(), "application/octet-stream")
+        else:
+            data, mime = self.thumbnail_data(item, 1024), "image/webp"
+        with Image.open(path) as image:
+            width, height = image.size
+            frames = getattr(image, "n_frames", 1)
+        return (
+            data,
+            mime,
+            {
+                "width": width,
+                "height": height,
+                "bytes": path.stat().st_size,
+                "animated": frames > 1,
+            },
+        )
+
+    def fill_phashes(self, limit=300):
+        """Hash images saved before similarity detection existed; return remaining."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT id, filename FROM images WHERE phash_checked=0 LIMIT ?",
+                (limit,),
+            ).fetchall()
+        updates = []
+        for row in rows:
+            try:
+                value = perceptual_hash(self.path({"filename": row["filename"]}))
+            except (OSError, ValueError):
+                value = ""
+            updates.append((value, row["id"]))
+        if updates:
+            with self.connect() as connection:
+                connection.executemany(
+                    "UPDATE images SET phash=?, phash_checked=1 WHERE id=?", updates
+                )
+            self.invalidate()
+        with self.connect() as connection:
+            return connection.execute(
+                "SELECT COUNT(*) FROM images WHERE phash_checked=0"
+            ).fetchone()[0]
+
+    def similar_groups(self, distance=SIMILAR_DISTANCE):
+        """Group near-identical active images around one anchor each.
+
+        Members must each be close to the anchor itself; chaining A~B~C is not
+        allowed, otherwise a sticker series on one background collapses into
+        one huge group.
+        """
+        items = [
+            item
+            for item, _, _ in self._entries()
+            if not item["deleted"] and len(item["phash"]) == HASH_BITS // 2
+        ]
+        values = {item["id"]: hash_parts(item["phash"]) for item in items}
+        with self.connect() as connection:
+            dismissed = {
+                (row[0], row[1])
+                for row in connection.execute("SELECT a, b FROM similar_dismissed")
+            }
+        buckets = {}
+        for item in items:
+            first = values[item["id"]][0]
+            for index, (start, end) in enumerate(BANDS):
+                part = (first >> (HASH_BITS - end)) & ((1 << (end - start)) - 1)
+                buckets.setdefault((index, part), []).append(item["id"])
+        neighbours = {item["id"]: set() for item in items}
+        checked = set()
+        for members in buckets.values():
+            # A huge bucket means a generic pattern; comparing it would be quadratic.
+            if len(members) < 2 or len(members) > 400:
+                continue
+            for i, a in enumerate(members):
+                for b in members[i + 1 :]:
+                    pair = (a, b) if a < b else (b, a)
+                    if pair in checked:
+                        continue
+                    checked.add(pair)
+                    if (
+                        pair not in dismissed
+                        and hash_distance(values[a], values[b]) <= distance
+                    ):
+                        neighbours[a].add(b)
+                        neighbours[b].add(a)
+        lookup = {item["id"]: item for item in items}
+
+        def rank(item_id):
+            item = lookup[item_id]
+            return (in_inbox(item), -item["sent"], -len(item["tags"]), item_id)
+
+        assigned, result = set(), []
+        for anchor in sorted((i for i in neighbours if neighbours[i]), key=rank):
+            if anchor in assigned:
+                continue
+            members = [m for m in neighbours[anchor] if m not in assigned]
+            if not members:
+                continue
+            group = [anchor, *sorted(members, key=rank)]
+            assigned.update(group)
+            result.append([self.copy(lookup[i]) for i in group])
+        result.sort(key=lambda group: (-len(group), -max(i["id"] for i in group)))
+        return result
+
+    def dismiss_similar(self, ids):
+        ids = sorted({int(i) for i in ids})
+        if len(ids) < 2:
+            raise ValueError("请至少选择两张图片")
+        with self.connect() as connection:
+            connection.executemany(
+                "INSERT OR IGNORE INTO similar_dismissed(a, b) VALUES(?, ?)",
+                [(a, b) for index, a in enumerate(ids) for b in ids[index + 1 :]],
+            )
+
+    def merge(self, keep, ids):
+        try:
+            return self._merge(keep, ids)
+        finally:
+            self.invalidate()
+
+    def _merge(self, keep, ids):
+        """Keep one image, absorb the others' tags/notes/counts, recycle the rest."""
+        others = [int(i) for i in dict.fromkeys(ids) if int(i) != int(keep)]
+        if not others:
+            raise ValueError("请至少选择一张要合并的图片")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+
+            def load(image_id):
+                item = self.record(
+                    connection.execute(
+                        "SELECT * FROM images WHERE id=? AND deleted IS NULL",
+                        (image_id,),
+                    ).fetchone()
+                )
+                return item
+
+            target = load(int(keep))
+            sources = [load(image_id) for image_id in others]
+            tags = [t for t in target["tags"] if t not in INBOX_TAGS]
+            for source in sources:
+                tags.extend(t for t in source["tags"] if t not in INBOX_TAGS)
+            tags = list(dict.fromkeys(tags)) or target["tags"]
+            if len(tags) > 24:
+                raise ValueError("合并后标签超过 24 个，请先整理标签")
+            caption = target["caption"] or next(
+                (s["caption"] for s in sources if s["caption"]), ""
+            )
+            ocr = target["ocr"] or next((s["ocr"] for s in sources if s["ocr"]), "")
+            connection.execute(
+                "UPDATE images SET tags=?, caption=?, ocr=?, sent=? WHERE id=?",
+                (
+                    json.dumps(tags, ensure_ascii=False),
+                    caption,
+                    ocr,
+                    target["sent"] + sum(s["sent"] for s in sources),
+                    target["id"],
+                ),
+            )
+            connection.executemany(
+                "UPDATE images SET deleted=? WHERE id=?",
+                [(time.time(), source["id"]) for source in sources],
+            )
+        return len(sources)
 
     def export(self):
         items = self.search() + self.search(deleted=True)
@@ -539,7 +920,7 @@ def render_preview(library, items, query, page, pages, total):
     )
     draw.text(
         (26, 62),
-        f"第 {page}/{pages} 页 · 共 {total} 张  |  发图 编号 · 下一页",
+        f"第 {page}/{pages} 页 · 共 {total} 张 · 发送「发图 编号」取原图",
         font=font(19),
         fill="#596778",
     )
