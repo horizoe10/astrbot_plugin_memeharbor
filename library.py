@@ -931,6 +931,26 @@ class Library:
             )
         return len(sources)
 
+    def merge_groups(self, groups, keeps=None):
+        """Merge every similar group into one picture each.
+
+        keeps maps a member id to the picture chosen to stay; groups without a
+        choice keep their first (most used, best tagged) picture. A group that
+        cannot be merged (for example, too many tags) is skipped.
+        Returns (groups merged, pictures moved to the trash, groups skipped).
+        """
+        keeps = {int(k): int(v) for k, v in (keeps or {}).items()}
+        done = moved = skipped = 0
+        for group in groups:
+            ids = [item["id"] for item in group]
+            keep = next((keeps[i] for i in ids if keeps.get(i) in ids), ids[0])
+            try:
+                moved += self.merge(keep, ids)
+                done += 1
+            except ValueError:
+                skipped += 1
+        return done, moved, skipped
+
     # ---------- tag aliases ----------
 
     def aliases(self):
